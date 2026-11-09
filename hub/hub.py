@@ -224,8 +224,20 @@ ECHO_BACKSTOP = 12.0
 # `stationEdits` (§18.2): a `character` or `stop` signal with `apply` edits the
 # bound station's queue here, for every device; without it each client edits the
 # rows it fetched itself.
+# `playOrder` (W1, decision D1): under shuffle the PLAYING device owns play order.
+# A device with the cap of the same name publishes `shuffle` + `order` with its
+# `setQueue`, and this hub steps that order; see PLAY_ORDER_CAP.
 HUB_FEATURES = ["cmdEcho", "actAck", "volumeTarget", "sleepTimer", "station",
-                "stationEdits"]
+                "stationEdits", "playOrder"]
+# "I publish my play order and adopt yours." Between this hub and a device that
+# says so: its `act:setQueue` carries `shuffle` + `order` (a permutation of that
+# frame's rows, in play order; null when not shuffled), which replace the session's
+# while it is the active device (or is promoted by that act), and every `load`,
+# `queueChanged` and `setShuffle` it is sent carries the session's `shuffle` +
+# `order`, which it adopts verbatim. `_do` adds them, nowhere else. A device without
+# the cap (0.7.0, the cast bridges) gets today's frames and today's hub-made order.
+PLAY_ORDER_CAP = "playOrder"
+PLAY_ORDER_CMDS = frozenset({"load", "queueChanged", "setShuffle"})
 # "I apply `do:setVolume` while I am not the playing device." Only a device that
 # says so on its current connection is sent one while idle (PROTOCOL §5.1): to
 # anything else the directive would be a level recorded here and applied nowhere.
@@ -6666,6 +6678,8 @@ class UserSpace:
         # re-created: this space is archived, never handed to the new account.
         self.navidrome_id: Optional[str] = None
         self.session = Session()
+        # Devices already logged for an invalid published play order (W1).
+        self._bad_order_logged: set[str] = set()
         self.devices: dict[str, Device] = {}
         # Rolling saved-queue history (Continue Listening), authoritative for this user.
         # Keyed by record id; capped at SAVED_QUEUES_MAX, oldest by updatedAt evicted.
@@ -7229,6 +7243,11 @@ class UserSpace:
         `required` is `_send_required`: the caller's next step depends on delivery.
         """
         frame = {"t": "do", "cmd": cmd, **fields}
+        if cmd in PLAY_ORDER_CMDS and dev is not None and PLAY_ORDER_CAP in (dev.caps or []):
+            # The order rides in the frame with the queue it indexes, so it cannot
+            # outlive that queue on the device (design §1).
+            frame["shuffle"] = self.session.shuffle
+            frame["order"] = self._wire_order()
         if cmd in ECHO_CMDS and dev is not None and dev.ws is not None:
             stamped = self._echo_expect(dev, seq)
             if stamped is not None:
@@ -7808,6 +7827,55 @@ class UserSpace:
         if self.session.order and len(self.session.order) == n:
             return self.session.order
         return list(range(n))
+
+    @staticmethod
+    def _plays_order(dev: Optional[Device]) -> bool:
+        """Does this device publish and adopt play order (PLAY_ORDER_CAP)?"""
+        return dev is not None and PLAY_ORDER_CAP in (dev.caps or [])
+
+    @staticmethod
+    def _valid_order(order: Any, n: int) -> bool:
+        """A permutation of range(n): every row of the frame's queue exactly once."""
+        return (isinstance(order, list) and len(order) == n
+                and all(type(v) is int for v in order) and sorted(order) == list(range(n)))
+
+    def _wire_order(self) -> Optional[list[int]]:
+        """The session's order as a `playOrder` device is sent it: null unless
+        shuffled, and never one that does not index the queue it travels with."""
+        s = self.session
+        if s.shuffle and self._valid_order(s.order, len(s.queue)) and s.queue:
+            return list(s.order)
+        return None
+
+    def _order_owner_here(self) -> bool:
+        """Do the play-order rules (design §2) govern this session's edits? Yes while
+        a `playOrder` device plays, or nobody does (the hub keeps the order in
+        custody). A device without the cap keeps today's behaviour exactly."""
+        active = self._dev(self.session.active_device_id)
+        return active is None or self._plays_order(active)
+
+    def _adopt_published_order(self, dev: Device, msg: dict) -> bool:
+        """`act:setQueue` from the playing `playOrder` device: its `shuffle` and
+        `order` become the session's. Returns False when it published shuffle on
+        with an order that does not index its queue; the session then holds a
+        current-first order of the hub's, which the caller sends back."""
+        s = self.session
+        s.shuffle = msg["shuffle"]
+        if not s.shuffle or not s.queue:
+            s.order = None
+            return True
+        order = msg.get("order")
+        if self._valid_order(order, len(s.queue)):
+            s.order = list(order)
+            return True
+        self._rebuild_order()
+        self.hub._bad_orders += 1  # noqa: SLF001 — same module
+        if dev.id not in self._bad_order_logged:
+            self._bad_order_logged.add(dev.id)
+            log(f"{dev.name} ({dev.id[:8]}) published shuffle with an order that is not "
+                f"a permutation of its {len(s.queue)} rows; sent it the hub's (logged "
+                f"once per device, counted in /health badOrders)")
+        return False
 
     def _rebuild_order(self) -> None:
         """Shuffle queue indices from scratch, keeping the current track first.
@@ -8424,7 +8492,17 @@ class UserSpace:
             s.position_ms = max(0, int(msg.get("positionMs", 0)))
             s.is_playing = bool(msg.get("play", True))
             self._mark_play_intent()
-            self._rebuild_order()
+            # Play order (design §1, §3). The playing `playOrder` device (or the one
+            # this act promotes) says what it plays and in which order; from anyone
+            # else the keys mean nothing and the hub proposes a current-first order,
+            # which the active device is sent in the `load` below.
+            order_ok = True
+            published = (self._plays_order(dev) and active == dev.id
+                         and isinstance(msg.get("shuffle"), bool))
+            if published:
+                order_ok = self._adopt_published_order(dev, msg)
+            else:
+                self._rebuild_order()
             # Saved-queue identity: adopt the client's id (or mint one) and record it as
             # the current history entry. Re-publishing the SAME id (e.g. a reporter
             # re-publish) just refreshes that record rather than forking a new one.
@@ -8461,6 +8539,9 @@ class UserSpace:
             if active and active != dev.id:
                 await self._do(adev, "load", tracks=s.queue, index=s.index,
                                positionMs=s.position_ms, play=s.is_playing)
+            if not order_ok:
+                # So that the device and the session step the same order.
+                await self._do(dev, "setShuffle", on=s.shuffle, order=s.order)
             await self._broadcast_session()
             await self._broadcast_saved_queues()
 
@@ -8511,11 +8592,25 @@ class UserSpace:
             jump_after_remove = False
             if action == "remove":
                 i = int(msg["index"])
+                # Rule 2 (design §2): the playing row's successor is the row after it
+                # in PLAY order, taken before the order loses it.
+                in_order = (i == s.index and self._order_owner_here()
+                            and self._valid_order(s.order, len(s.queue)))
+                succ = self._next_in_order(i) if in_order else None
                 if 0 <= i < len(s.queue):
                     s.queue.pop(i)
                     self._order_after_remove(i)
                     if i < s.index:
                         s.index -= 1
+                    elif in_order:
+                        if succ is not None and succ != i and s.queue:
+                            s.index = succ - 1 if succ > i else succ
+                        else:
+                            # Nothing after it in play order: stop on the last row.
+                            s.index = s.order[-1] if s.order else 0
+                            s.is_playing = False
+                        s.position_ms = 0
+                        jump_after_remove = True
                     elif i == s.index:
                         if s.index >= len(s.queue):
                             # Dropped the last track: wrap when repeating, else stop.
@@ -9100,6 +9195,7 @@ class Hub:
         self._do_seq = 0
         self._stale_reports = 0  # /health: reports dropped for `applied` < need
         self._echo_backstops = 0  # /health: times ECHO_BACKSTOP expired on a device
+        self._bad_orders = 0  # /health: invalid published play orders (W1)
         # Monotonic id for every handoff, carried on do:release/released and
         # do:load/loaded so a reply can be matched to the attempt that asked for it.
         self._transfer_seq = 0
@@ -9888,6 +9984,9 @@ class Hub:
             # ECHO_BACKSTOP: above zero means one is breaking its contract.
             "staleReports": self._stale_reports,
             "echoBackstops": self._echo_backstops,
+            # W1: `setQueue`s from a `playOrder` device whose shuffle order did not
+            # index its queue (answered with the hub's order). Above zero = a client bug.
+            "badOrders": self._bad_orders,
         }
 
     def _state_payload(self) -> tuple[str, Optional[str]]:
