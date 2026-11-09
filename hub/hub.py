@@ -1768,8 +1768,15 @@ LB_ROUTES: dict[tuple[str, str], dict] = {
         # mbid and `gaps` keyed by review-group id, plus `serverTime`. A Download
         # Center with eight rows used to poll eight times per tick; now one, on
         # the fast pool, so it never queues behind a source search.
+        #
+        # `coalesce: False` (B-233): a client counts a progress read only when it
+        # was SENT after an action's answer arrived (fetch, auto, cancel). Joining
+        # an identical read already upstream — typically its own poll sent before
+        # the tap — hands it a body lb-bot computed before the action, and the
+        # watch settles on the state the action replaced. Same reason as the
+        # listening summary's; the poll is one call per client per tick anyway.
         "method": "GET", "path": "/api/fills",
-        "params": ("release_mbids", "group_ids"), "cache": False,
+        "params": ("release_mbids", "group_ids"), "cache": False, "coalesce": False,
     },
     ("POST", "/lb/album/allow-mp3"): {
         # lb-bot puts the group id in the URL; the clients send it in the body so
@@ -1787,9 +1794,12 @@ LB_ROUTES: dict[tuple[str, str], dict] = {
         # rather than bytes. The clients' picker shows per-source summaries
         # (peer, format, bitrate, coverage, flags, score), never the filenames, so
         # dropping them here also keeps other people's file paths off the device.
+        # `coalesce: False` for `/lb/fills`' reason (B-233): a read sent after
+        # an action's answer must be computed after it, not joined to the poll
+        # that left before it.
         "method": "GET", "path": "/api/gaps/{group_id}",
         "path_args": ("group_id",), "params": ("group_id", "sourcePage"),
-        "cache": False, "timeout": PROXY_SLOW_TIMEOUT,
+        "cache": False, "coalesce": False, "timeout": PROXY_SLOW_TIMEOUT,
         # `tracks[].placeFolder`/`placeFile` are lb-bot HOST paths (an absolute
         # `/downloads/<folder>` path and a peer's raw filename) — its own SPA
         # reads them directly, not through the hub, and no client code needs
