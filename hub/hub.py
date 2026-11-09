@@ -1720,8 +1720,14 @@ LB_ROUTES: dict[tuple[str, str], dict] = {
         # a hard 400 on that album for everyone who asked next. The client got
         # these values from /lb/album/releases, so they cost nothing and no new
         # route is involved.
+        #
+        # `refresh` is the client's "Search again" (B-256): lb-bot answers from
+        # the list it kept until `refresh=1` asks it to search afresh. Unlisted,
+        # `_filtered_params` dropped it before PROXY_NO_CACHE_PARAMS was read,
+        # so the 60 s cache answered and lb-bot never heard the request.
         "method": "GET", "path": "/api/album/sources",
-        "params": ("rgid", "release_mbid", "artist", "album", "total"), "cache": True,
+        "params": ("rgid", "release_mbid", "artist", "album", "total", "refresh"),
+        "cache": True,
         # A live slskd fan-out, not a MusicBrainz hop — see PROXY_SEARCH_TIMEOUT.
         "timeout": PROXY_SEARCH_TIMEOUT,
     },
