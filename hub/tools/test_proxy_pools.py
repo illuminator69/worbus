@@ -11,7 +11,8 @@ upstream and proves:
 
 1. with four slow `album/sources` calls in flight, `album/status` still answers
    in well under a second (the fast pool);
-2. five concurrent identical `GET /lb/fills` reach the stub exactly once;
+2. five concurrent identical `GET /lb/album/status` reach the stub exactly once
+   (`/lb/fills`, the example until B-233, opts out: every read is its own call);
 3. a request that cannot get a fast slot in time is answered `503 busy` rather
    than left hanging.
 
@@ -53,7 +54,7 @@ class Upstream(http.server.BaseHTTPRequestHandler):
             hits[path] = hits.get(path, 0) + 1
         if path in ("/api/album/sources", "/api/gaps/slow"):
             time.sleep(SLOW)
-        if path == "/api/fills":
+        if path == "/api/album/status" and "release_mbid=coalesce" in self.path:
             time.sleep(0.4)  # long enough for five callers to pile up behind one
         raw = json.dumps({"path": path, "state": "downloading"}).encode()
         self.send_response(200)
@@ -112,13 +113,13 @@ def main() -> int:
 
         # 2. identical in-flight reads coalesce into one upstream call
         with hits_lock:
-            hits.pop("/api/fills", None)
-        fills = [pool.submit(get, port, "/lb/fills?release_mbids=a,b") for _ in range(5)]
-        results = [f.result() for f in fills]
+            hits.pop("/api/album/status", None)
+        reads = [pool.submit(get, port, "/lb/album/status?release_mbid=coalesce") for _ in range(5)]
+        results = [f.result() for f in reads]
         if any(s != 200 for s, _b, _e in results):
             failures.append(f"coalesced reads did not all answer 200: {[s for s, _b, _e in results]}")
         with hits_lock:
-            n = hits.get("/api/fills", 0)
+            n = hits.get("/api/album/status", 0)
         if n != 1:
             failures.append(f"five identical concurrent reads reached upstream {n} times, expected 1")
 

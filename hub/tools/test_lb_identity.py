@@ -18,7 +18,7 @@ primary user whatever the X-Worbus-* headers say.
                                       primary user), and a non-Latin name sent as
                                       UTF-8 bytes (R11); all three headers always
   test_cache_key_carries_role_class   /lb/wishlist and /lb/fresh-releases (cached)
-                                      and /lb/fills (coalesced): an admin's answer
+                                      and /lb/album/status (coalesced): an admin's answer
                                       never reaches a non-admin, nor a primary
                                       user's a non-primary; one class still shares
   test_old_lbbot_refuses_all_but_primary
@@ -115,7 +115,7 @@ class StubLbBot:
                         body["identity"] = 1
                     self._send(200, body)
                     return
-                if stub.slow_s and path in ("/api/wishlist", "/api/fills"):
+                if stub.slow_s and path in ("/api/wishlist", "/api/fills", "/api/album/status"):
                     time.sleep(stub.slow_s)
                 if path == "/api/wishlist" and method == "POST":
                     self._send(200, {"ok": True})
@@ -133,6 +133,9 @@ class StubLbBot:
                     self._send(200, {"albums": {"m1": {"state": "searching",
                                                        **({"peer": "peer-x"} if admin else {})}},
                                      "gaps": {}, "serverTime": 1})
+                elif path == "/api/album/status":
+                    self._send(200, {"state": "searching",
+                                     **({"peer": "peer-x"} if admin else {})})
                 else:
                     self._send(404, {"error": "not found"})
 
@@ -220,21 +223,24 @@ async def t_cache_roles(h: HubProc, lb: StubLbBot, sec: dict) -> list[str]:
         f.append(f"the owner's Fresh lacks artistPlays: {o}")
     if "artistPlays" in json.dumps(al):
         f.append("alice (admin, not primary) was served the owner's artistPlays")
-    # /lb/fills is coalesced, not cached: two classes at once are two calls.
-    lb.slow_s = 1.0
-    n = len(lb.calls("/api/fills"))
-    with ThreadPoolExecutor(4) as ex:
-        futs = [ex.submit(_get, h, "/lb/fills", sec[w]) for w in ("alice", "bob", "alice")]
-        res = [x.result() for x in futs]
-    lb.slow_s = 0.0
-    calls = len(lb.calls("/api/fills")) - n
-    if calls != 2:
-        f.append(f"alice, bob, alice at once made {calls} upstream fills calls, not 2")
-    bob_body = json.dumps(res[1][1])
-    if "peer" in bob_body:
-        f.append("bob was handed alice's coalesced fills (peer names)")
-    if "peer" not in json.dumps(res[0][1]) or "peer" not in json.dumps(res[2][1]):
-        f.append("an admin's fills lost the peer field")
+    # /lb/album/status is coalesced, not cached: two classes at once are two
+    # calls. (/lb/fills was the example until it opted out of coalescing, B-233;
+    # every read of it is its own call, checked below.)
+    for route, upstream, want in (("/lb/album/status?release_mbid=m1", "/api/album/status", 2),
+                                  ("/lb/fills", "/api/fills", 3)):
+        lb.slow_s = 1.0
+        n = len(lb.calls(upstream))
+        with ThreadPoolExecutor(4) as ex:
+            futs = [ex.submit(_get, h, route, sec[w]) for w in ("alice", "bob", "alice")]
+            res = [x.result() for x in futs]
+        lb.slow_s = 0.0
+        calls = len(lb.calls(upstream)) - n
+        if calls != want:
+            f.append(f"alice, bob, alice at once made {calls} upstream {route} calls, not {want}")
+        if "peer" in json.dumps(res[1][1]):
+            f.append(f"bob was handed alice's {route} answer (peer names)")
+        if "peer" not in json.dumps(res[0][1]) or "peer" not in json.dumps(res[2][1]):
+            f.append(f"an admin's {route} answer lost the peer field")
     return f
 
 
@@ -509,7 +515,7 @@ def main() -> int:
     if failures:
         return 1
     print("PASS - lb identity: headers-carry-the-caller(+legacy-as-primary,+utf8-name)/"
-          "cache-and-coalesce-by-role-class(wishlist,fresh,fills)/"
+          "cache-and-coalesce-by-role-class(wishlist,fresh,album-status,fills-uncoalesced)/"
           "old-lbbot-refuses-all-but-primary/identity-in-welcome/"
           "lbbot-after-hub-identity-in-one-read/swap-to-p1-write-never-forwarded/"
           "swap-to-p1-read-refused-not-cached/cache-from-before-swap-not-served")
