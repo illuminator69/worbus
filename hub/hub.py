@@ -10698,6 +10698,11 @@ def startup_config_refusal(token: str, host: str, allow_insecure_no_auth: bool,
         if not preview_secret.strip():
             return ("PREVIEW_SECRET is not set but PREVIEW_URL is; set your own "
                     "(for example `openssl rand -hex 16`), or unset PREVIEW_URL.")
+        # Only the hub holds both (B-312). HUB_TOKEN is the whole administrative
+        # surface, and the sidecar's environment holds its preview secret.
+        if token.strip() and _unquote(preview_secret) == _unquote(token):
+            return ("PREVIEW_SECRET is the same as HUB_TOKEN; give the preview "
+                    "sidecar a secret of its own (for example `openssl rand -hex 16`).")
     # Required since Worbus P2: users sign in against this Navidrome, the service
     # account re-reads them, and HUB_ND_USER is the primary user, whose space
     # today's state migrates to. Checked last, so the lines above keep their order.
@@ -10747,9 +10752,6 @@ async def main() -> None:
         server_id = load_or_mint_server_id(STATE_PATH)
     except ConfigRefusal as e:
         raise SystemExit(str(e)) from None
-    if MIRROR_PLAYQUEUE and not NAVIDROME_URL:
-        log("WARNING: HUB_MIRROR_PLAYQUEUE is on but NAVIDROME_URL is unset — "
-            "the savePlayQueue mirror is disabled. Set it in .env.")
     if AUDIOMUSE_URL and not TOKEN:
         log("WARNING: AUDIOMUSE_URL is set but HUB_TOKEN is empty — the AudioMuse "
             "proxy is DISABLED (it would be an open relay to the core API).")

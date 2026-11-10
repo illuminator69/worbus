@@ -750,16 +750,40 @@ async def serve_client(reader: asyncio.StreamReader,
             pass
 
 
+# `.env.example` ships a placeholder that starts with this; the hub refuses it too
+# (hub.py `_is_example_secret`). The two programs ship in separate images, so the
+# rule is written in each, and hub/tools/test_preview_secret_rules.py fails the
+# moment the two judge any value differently (B-312).
+_EXAMPLE_SECRET_PREFIX = "change-me"
+
+
+def secret_refusal(value: str) -> Optional[str]:
+    """Why this sidecar must not start with PREVIEW_SECRET = `value`, or None. Names
+    the setting, never the value."""
+    v = value.strip()
+    # `docker run --env-file` keeps quotes literally (compose strips them).
+    if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+        v = v[1:-1].strip()
+    if v.lower().startswith(_EXAMPLE_SECRET_PREFIX):
+        return ("PREVIEW_SECRET is still the example value; set your own "
+                "(for example `openssl rand -hex 16`), the SAME on the hub.\n"
+                "The example is public: anyone could sign a /stream URL with it, "
+                "which makes this an open media relay pointed at a third-party "
+                "extractor.")
+    if not value.strip():
+        return ("PREVIEW_SECRET is not set.\n"
+                "/stream is authorised by an HMAC capability in the URL, because a "
+                "Chromecast sends no headers. Without a secret every signature "
+                "verifies against an empty key, which makes this an open media relay "
+                "pointed at a third-party extractor.\n"
+                "Set the SAME value here and on the hub. It is NOT HUB_TOKEN.")
+    return None
+
+
 async def main() -> None:
-    if not SECRET:
-        raise SystemExit(
-            "PREVIEW_SECRET is not set.\n"
-            "/stream is authorised by an HMAC capability in the URL, because a "
-            "Chromecast sends no headers. Without a secret every signature "
-            "verifies against an empty key, which makes this an open media relay "
-            "pointed at a third-party extractor.\n"
-            "Set the SAME value here and on the hub. It is NOT HUB_TOKEN."
-        )
+    refusal = secret_refusal(SECRET)
+    if refusal:
+        raise SystemExit(refusal)
     global _extract_sem, _stream_sem
     _extract_sem = asyncio.Semaphore(MAX_EXTRACTIONS)
     _stream_sem = asyncio.Semaphore(MAX_STREAMS)
