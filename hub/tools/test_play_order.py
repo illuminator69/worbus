@@ -178,7 +178,8 @@ def insert_rule(failures):
     hub's one insert function (in-process): an APPEND (lands at the end of the
     queue) goes to the end of play order; Play next right after the current row;
     an insert into the MIDDLE of the queue right after its queue predecessor's
-    play position (at the front when it has none)."""
+    play position; above the first row (no predecessor), right before its queue
+    successor's play position."""
     sys.path.insert(0, os.path.dirname(os.path.abspath(HUB_PY)))
     import hub  # noqa: E402
     from types import SimpleNamespace
@@ -198,7 +199,10 @@ def insert_rule(failures):
         ("middle insert at row 2 (after row 1)", (base, 4, 2, 1, False), [0, 4, 6, 1, 2, 5, 3]),
         ("middle insert of 2 at row 4 (after row 3)", (base, 0, 4, 2, False),
          [0, 3, 4, 5, 7, 1, 6, 2]),
-        ("middle insert at row 0 (no predecessor)", (base, 4, 0, 1, False), [0, 1, 4, 6, 2, 5, 3]),
+        ("insert above row 0 (row 0 first in play order)", (base, 4, 0, 1, False),
+         [0, 1, 4, 6, 2, 5, 3]),
+        ("insert above row 0 (row 0 second in play order)", ([3, 0, 5, 1, 4, 2], 3, 0, 2, False),
+         [5, 0, 1, 2, 7, 3, 6, 4]),
     ]
     for name, args, want in cases:
         got = run(*args)
@@ -304,13 +308,56 @@ async def review_cases(failures):
         if c.session.get("isPlaying") is not False:
             failures.append(f"remove last of play order: session isPlaying "
                             f"{c.session.get('isPlaying')!r}")
+
+        # A publish that does not change play state must not restart INTENT_GRACE:
+        # a paused active device publishes every edit (play:false), and a play
+        # pressed on it right after must not read paused for 2 s. D has no cmdEcho,
+        # so its reports are judged by the clock.
+        await d.act(action="setQueue", tracks=rows("g", 3), index=0, play=False,
+                    shuffle=False, order=None)
+        await asyncio.sleep(2.3)  # past the grace of that (real) change
+        await d.act(action="setQueue", tracks=rows("g", 4), index=0, play=False,
+                    shuffle=False, order=None)            # an edit while paused
+        await d.report(index=0, positionMs=1000, isPlaying=True)   # play pressed on D
+        if c.session.get("isPlaying") is not True:
+            failures.append("paused publish: a play on the device right after a paused "
+                            "edit was ignored (the publish restarted INTENT_GRACE)")
+        await asyncio.sleep(2.3)
+        await d.act(action="setQueue", tracks=rows("g", 5), index=0, play=True,
+                    positionMs=3000, shuffle=False, order=None)    # an edit while playing
+        await d.report(index=0, positionMs=3200, isPlaying=False)  # pause pressed on D
+        if c.session.get("isPlaying") is not False:
+            failures.append("playing publish: a pause on the device right after an edit "
+                            "was ignored (the publish restarted INTENT_GRACE)")
+
+        # Each publish while playing must not count the playing song in the play
+        # history again (its next real departure is the same play).
+        h = [{"id": f"h{i}", "title": f"H{i}", "artist": "Hx", "durationMs": 600000}
+             for i in range(4)]
+        await d.act(action="setQueue", tracks=h[:2], index=0, play=True, positionMs=0,
+                    shuffle=False, order=None)
+        await d.report(index=0, positionMs=250000, isPlaying=True)
+        for n in (3, 4, 4):
+            await d.act(action="setQueue", tracks=h[:n], index=0, play=True,
+                        positionMs=251000, shuffle=False, order=None)
+            await d.report(index=0, positionMs=252000, isPlaying=True)
+        await d.report(index=1, positionMs=0, isPlaying=True)   # h0 really ends
     finally:
         hub.terminate()
         try:
             hub.wait(timeout=5)
         except subprocess.TimeoutExpired:
             hub.kill()
-        for p in (state, state + ".bak"):
+        try:
+            with open(state + ".history", encoding="utf-8") as f:
+                plays = json.load(f).get("plays", [])
+            n_h0 = sum(1 for p in plays if p and p[0] == "h0")
+            if n_h0 != 1:
+                failures.append(f"history: the playing song h0 has {n_h0} plays after three "
+                                f"publishes and one departure; expected 1")
+        except FileNotFoundError:
+            failures.append("history: no history file written")
+        for p in (state, state + ".bak", state + ".history", state + ".stations"):
             try:
                 os.unlink(p)
             except FileNotFoundError:
