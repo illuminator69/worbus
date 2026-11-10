@@ -101,10 +101,14 @@ def judgements(log_path):
 
 def jump_target(n: int, x: int, order: list) -> int:
     """Step 8's jump: an index that is NOT next in play order after `x`, preferring
-    x's index neighbour (the track a sequential queue would play next)."""
+    x's index neighbour (the track a sequential queue would play next). When x sits
+    at a queue edge and its one neighbour IS next in play order (a shuffle the hub
+    may make, B-258), any other index is the jump: what is asserted, a jump that is
+    not next in play order does not steer, holds for it all the same."""
     pos = order.index(x) if x in order else 0
-    return next(i for i in range(n) if i != x
-                and i != order[(pos + 1) % len(order)] and abs(i - x) == 1)
+    nxt = order[(pos + 1) % len(order)]
+    candidates = [i for i in range(n) if i not in (x, nxt)]
+    return next((i for i in candidates if abs(i - x) == 1), candidates[0])
 
 
 def jump_target_selfcheck(failures) -> None:
