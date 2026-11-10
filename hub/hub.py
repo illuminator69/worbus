@@ -4806,14 +4806,17 @@ class StationEngine:
         return self._interleave([mix + self._round_robin(per)])
 
     # ----- one batch --------------------------------------------------------- #
-    def _levels(self, st: Station, tier1_primary: bool) -> list[tuple[str, int, int]]:
+    def _levels(self, tune: _StationTuning, tier1_primary: bool,
+                mood: bool = False) -> list[tuple[str, int, int]]:
         """The widening ladder (§18.3) as (rung, ceiling, history days). The first
         is the lists walked to the character's ceiling; then the ceiling ×1.5 up to
         its maximum; then the history window down to 3 days; then Tier 1. The
         played-through-neighbours and similar-artists rungs are Explore's sources
         from the first rung on; on Close and Balanced they could only offer what
-        the anchor gate already holds, so they add no rung of their own."""
-        tune = st.tune()
+        the anchor gate already holds, so they add no rung of their own.
+
+        The one ladder: a station walks it (`_compute`, with its own `tune()` and
+        `mood`), and `count` reads its top for `reach` (B-178)."""
         top = tune.ceiling_max if not tier1_primary else min(tune.ceiling_max,
                                                              STATION_TIER1_MAX)
         ceiling = min(tune.ceiling, top)
@@ -4823,7 +4826,7 @@ class StationEngine:
             out.append((f"ceiling {ceiling}", ceiling, STATION_HISTORY_DAYS))
         out.append(("history 3d", ceiling, STATION_HISTORY_RELAXED_DAYS))
         # Navidrome's similar songs know no mood: a mood station has no Tier 1 rung.
-        if not tier1_primary and self.tier1_configured() and not st.mood:
+        if not tier1_primary and self.tier1_configured() and not mood:
             out.append(("tier1", ceiling, STATION_HISTORY_RELAXED_DAYS))
         return out
 
@@ -4875,7 +4878,7 @@ class StationEngine:
                     b.failed = True
                     return []
                 mood_filter = {r["id"] for r in filter_rows}
-        levels = self._levels(st, tier1_primary)
+        levels = self._levels(tune, tier1_primary, bool(st.mood))
         li = 0
         while li < len(levels) and len(picked) < count and b.left() > 0:
             rung, ceiling, days = levels[li]
@@ -4904,7 +4907,7 @@ class StationEngine:
                         break
                     tier1_primary = True
                     b.engine = "tier1"
-                    levels, li = self._levels(st, True), 0
+                    levels, li = self._levels(tune, True, bool(st.mood)), 0
                 continue
             hist_ids, hist_keys = self._history_sets(days, now)
 
@@ -5366,20 +5369,20 @@ class StationEngine:
                 got = {r["id"] for rows in ls if rows for r in rows} - set(ids)
                 return got & filter_ids if filter_ids is not None else got
 
-            # `reach` (§18.1): the pool at the ladder's top, which is where a station
-            # that runs short really draws from (`_levels` widens up to ceiling_max).
-            # Asked only when the first ceiling's count is small; a roomy radio costs
-            # nothing more. The deeper lists are fetched once per seed (the first
-            # ceiling's lists are a prefix of them); Tier 1's are already in hand.
+            # `reach` (§18.1): the pool at the top of the ladder a station of this
+            # seed would widen through, read off `_levels` itself, not re-derived
+            # (B-178). Asked only when the first ceiling's count is small; a roomy
+            # radio costs nothing more. The deeper lists are fetched once per seed
+            # (the first ceiling's lists are a prefix of them).
             wide: Optional[list] = None
             if len(pool_of(lists)) < STATION_COUNT_WIDEN_BELOW:
+                top = max(c for _r, c, _d in self._levels(tune, tier1))
                 if tier1:
-                    top = min(tune.ceiling_max, STATION_TIER1_MAX)
                     wide = await self._gather([self._tier1_list(i, top, b) for i in ids])
-                elif tune.ceiling_max > tune.ceiling:
-                    deep = _station_depth(tune.ceiling_max)
+                elif top > tune.ceiling:
+                    deep = _station_depth(top)
                     wide = await self._gather([self._nearest(i, deep, b) for i in ids])
-                    wide = [r[:tune.ceiling_max] if r is not None else None for r in wide]
+                    wide = [r[:top] if r is not None else None for r in wide]
         finally:
             self._counting.release()
         unknown = [i for i, rows in zip(ids, lists) if rows is not None and not rows]

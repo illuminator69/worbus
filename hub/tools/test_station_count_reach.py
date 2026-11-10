@@ -59,7 +59,7 @@ def make_engine(tier1: bool):
 def ladder_top(eng, character: str, tier1: bool) -> int:
     st = hubmod.Station(id="st_probe", seed={"kind": "track", "ids": [SEED]},
                         name="probe", character=character, created_at=0, used_at=0)
-    return max(c for _r, c, _d in eng._levels(st, tier1))
+    return max(c for _r, c, _d in eng._levels(st.tune(), tier1, bool(st.mood)))
 
 
 async def count(eng, character: str):
