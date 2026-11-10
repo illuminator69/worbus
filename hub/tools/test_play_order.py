@@ -60,8 +60,8 @@ class Client:
         self.dos = []
         self.index = 0
 
-    async def connect(self):
-        self.ws = await websockets.connect(URL)
+    async def connect(self, url=None):
+        self.ws = await websockets.connect(url or URL)
         await self.ws.send(json.dumps({
             "t": "hello", "token": TOKEN,
             "device": {"id": self.device_id, "name": self.name,
@@ -122,30 +122,199 @@ def is_perm(order, n):
 
 
 def source_guard(failures):
-    """`_do` is the one place `shuffle`/`order` join load/queueChanged/setShuffle.
+    """`_do` is the one place a `do` frame is built, and the one place `shuffle` /
+    `order` join load/queueChanged/setShuffle.
 
     A call site that built them itself could send them to a device without the
     cap (breaking "today's frames byte for byte") or forget them for one with it.
+    Fails on: a `{"t": "do"}` literal outside `_do`; a `_do` call whose command is
+    not a literal (or a conditional between literals); a `**` splat, `order=` or
+    `shuffle=` into one of the three; a `_do` that never names PLAY_ORDER_CAP.
     """
-    tree = ast.parse(open(HUB_PY, encoding="utf-8").read())
-    do_src = None
+    src = open(HUB_PY, encoding="utf-8").read()
+    tree = ast.parse(src)
+    do_fn = next((n for n in ast.walk(tree)
+                  if isinstance(n, ast.AsyncFunctionDef) and n.name == "_do"), None)
+    if do_fn is None:
+        failures.append("guard: no _do in hub.py")
+        return
+    inside = range(do_fn.lineno, do_fn.end_lineno + 1)
+    if not any(isinstance(n, ast.Name) and n.id == "PLAY_ORDER_CAP" for n in ast.walk(do_fn)):
+        failures.append("guard: _do does not test PLAY_ORDER_CAP (as a name, not a comment)")
     for node in ast.walk(tree):
-        if isinstance(node, ast.AsyncFunctionDef) and node.name == "_do":
-            do_src = ast.get_source_segment(open(HUB_PY, encoding="utf-8").read(), node)
+        if isinstance(node, ast.Dict) and node.lineno not in inside:
+            for k, v in zip(node.keys, node.values):
+                if (isinstance(k, ast.Constant) and k.value == "t"
+                        and isinstance(v, ast.Constant) and v.value == "do"):
+                    failures.append(f"guard: hub.py:{node.lineno} builds a do frame outside _do")
         if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-                and node.func.attr == "_do" and len(node.args) >= 2
-                and isinstance(node.args[1], ast.Constant)):
+                and node.func.attr == "_do"):
             continue
-        cmd = node.args[1].value
+        arg = node.args[1] if len(node.args) >= 2 else next(
+            (k.value for k in node.keywords if k.arg == "cmd"), None)
+        if isinstance(arg, ast.Constant):
+            cmds = {arg.value}
+        elif (isinstance(arg, ast.IfExp) and isinstance(arg.body, ast.Constant)
+              and isinstance(arg.orelse, ast.Constant)):
+            cmds = {arg.body.value, arg.orelse.value}
+        else:
+            failures.append(f"guard: hub.py:{node.lineno} calls _do with a non-literal command")
+            continue
         kws = {k.arg for k in node.keywords}
-        if cmd in ("load", "queueChanged") and kws & {"order", "shuffle"}:
+        hit = cmds & {"load", "queueChanged", "setShuffle"}
+        if not hit:
+            continue
+        if None in kws:
+            failures.append(f"guard: hub.py:{node.lineno} splats ** into _do({sorted(hit)})")
+        if hit & {"load", "queueChanged"} and kws & {"order", "shuffle"}:
             failures.append(f"guard: hub.py:{node.lineno} passes {sorted(kws & {'order', 'shuffle'})} "
-                            f"to _do('{cmd}') itself; only _do may add them")
-        if cmd == "setShuffle" and "shuffle" in kws:
+                            f"to _do({sorted(hit)}) itself; only _do may add them")
+        if "setShuffle" in hit and "shuffle" in kws:
             failures.append(f"guard: hub.py:{node.lineno} passes shuffle= to _do('setShuffle')")
-    if do_src is None or "PLAY_ORDER_CAP" not in do_src:
-        failures.append("guard: _do does not add shuffle/order for the playOrder cap "
-                        "(no PLAY_ORDER_CAP in its body)")
+
+
+def insert_rule(failures):
+    """The controller's ruling on where an inserted row goes in play order, on the
+    hub's one insert function (in-process): an APPEND (lands at the end of the
+    queue) goes to the end of play order; Play next right after the current row;
+    an insert into the MIDDLE of the queue right after its queue predecessor's
+    play position (at the front when it has none)."""
+    sys.path.insert(0, os.path.dirname(os.path.abspath(HUB_PY)))
+    import hub  # noqa: E402
+    from types import SimpleNamespace
+
+    def run(order, index, at, count, play_next):
+        sp = SimpleNamespace(session=hub.Session(queue=[{}] * len(order), index=index,
+                                                 order=list(order), shuffle=True))
+        hub.UserSpace._order_after_insert(sp, at, count, play_next)
+        return sp.session.order
+
+    base = [0, 3, 5, 1, 4, 2]   # 6 rows, playing row 4
+    cases = [
+        ("append 2", (base, 4, 6, 2, False), [0, 3, 5, 1, 4, 2, 6, 7]),
+        ("play next 2", (base, 4, 5, 2, True), [0, 3, 7, 1, 4, 5, 6, 2]),
+        ("play next, playing row last in queue", ([0, 5, 1, 2, 3, 4], 5, 6, 1, True),
+         [0, 5, 6, 1, 2, 3, 4]),
+        ("middle insert at row 2 (after row 1)", (base, 4, 2, 1, False), [0, 4, 6, 1, 2, 5, 3]),
+        ("middle insert of 2 at row 4 (after row 3)", (base, 0, 4, 2, False),
+         [0, 3, 4, 5, 7, 1, 6, 2]),
+        ("middle insert at row 0 (no predecessor)", (base, 4, 0, 1, False), [0, 1, 4, 6, 2, 5, 3]),
+    ]
+    for name, args, want in cases:
+        got = run(*args)
+        if got != want:
+            failures.append(f"insert rule ({name}): order {got}, expected {want}")
+
+
+async def review_cases(failures):
+    """Review fixes (2026-11-10): no `shuffle:true, order:null` on the wire and no
+    queue-order stepping under shuffle; a repeated bad order answered once; removing
+    the playing row at the end of play order pauses the device too."""
+    # An old state.json: shuffle on, no `order`.
+    state = tempfile.NamedTemporaryFile(suffix=".json", delete=False).name
+    with open(state, "w") as f:
+        json.dump({"session": {"queue": rows("s", 4), "index": 2, "shuffle": True,
+                               "positionMs": 0, "repeat": "none"}}, f)
+    port, hport = _free_port(), _free_port()
+    url = f"ws://127.0.0.1:{port}"
+    env = {**_inherited_env(), "HUB_TOKEN": TOKEN, "HUB_PORT": str(port),
+           "HUB_MIRROR_PLAYQUEUE": "false", "HUB_STATE": state, "HUB_HOST": "127.0.0.1",
+           "HUB_HEALTH_PORT": str(hport)}
+    hub = subprocess.Popen([sys.executable, "hub.py"], env=env,
+                           cwd=os.path.join(os.path.dirname(__file__), ".."))
+
+    def bad_count():
+        with urllib.request.urlopen(f"http://127.0.0.1:{hport}/", timeout=3) as r:
+            return json.loads(r.read()).get("badOrders")
+    try:
+        await asyncio.sleep(1.2)
+        d = Client("Rev-D", CAP)
+        c = Client("Rev-C", ["controller"])
+        await d.connect(url)
+        await c.connect(url)
+        wo = c.session.get("order")
+        if not is_perm(wo, 4) or wo[0] != 2:
+            failures.append(f"old state: welcome.session.order {wo!r} under shuffle; "
+                            f"expected a current-first permutation of 4")
+        await d.act(action="play")
+        ld = d.last("load")
+        lo = (ld or {}).get("order")
+        if not ld or ld.get("shuffle") is not True or not is_perm(lo, 4) or lo[0] != 2:
+            failures.append(f"old state: takeover load shuffle={(ld or {}).get('shuffle')!r} "
+                            f"order={lo!r}; expected True and a current-first permutation")
+        await c.act(action="next")
+        if is_perm(lo, 4) and c.session.get("index") != lo[1]:
+            failures.append(f"old state: next from row 2 -> {c.session.get('index')!r}, "
+                            f"expected {lo[1]} (the order sent), not queue order")
+
+        # clear, then a controller enqueue: shuffle stays on, so the order must exist.
+        await c.act(action="clear")
+        d.clear()
+        await c.act(action="enqueue", tracks=rows("k", 5), at="end")
+        qc = d.last("queueChanged")
+        qo = (qc or {}).get("order")
+        if not qc or qc.get("shuffle") is not True or not is_perm(qo, 5) \
+                or qo[0] != qc.get("index"):
+            failures.append(f"clear+enqueue: D's queueChanged shuffle={(qc or {}).get('shuffle')!r} "
+                            f"order={qo!r} index={(qc or {}).get('index')!r}; expected True and a "
+                            f"current-first permutation of 5")
+        if c.session.get("order") != qo:
+            failures.append(f"clear+enqueue: session.order {c.session.get('order')!r} != sent {qo!r}")
+        if is_perm(qo, 5):
+            await c.act(action="next")
+            if c.session.get("index") != qo[1]:
+                failures.append(f"clear+enqueue: next -> {c.session.get('index')!r}, expected {qo[1]}")
+
+        # The same bad publish, three times: answered once, counted three times.
+        q = rows("x", 6)
+        bad = [0, 0, 1, 2, 3, 4]
+        before = bad_count() or 0
+        d.clear()
+        await d.act(action="setQueue", tracks=q, index=3, play=True, shuffle=True, order=bad)
+        first = c.session.get("order")
+        await d.act(action="setQueue", tracks=q, index=3, play=True, shuffle=True, order=bad)
+        await d.act(action="setQueue", tracks=q, index=3, play=True, shuffle=True, order=bad)
+        n = sum(1 for x in d.dos if x.get("cmd") == "setShuffle")
+        if n != 1:
+            failures.append(f"repeated bad order: {n} setShuffle frames for 3 identical "
+                            f"publishes; expected 1")
+        if c.session.get("order") != first:
+            failures.append(f"repeated bad order: session.order moved {first!r} -> "
+                            f"{c.session.get('order')!r} without telling the device")
+        if bad_count() != before + 3:
+            failures.append(f"repeated bad order: badOrders {before} -> {bad_count()!r}, expected +3")
+        # A valid publish in between, then the same bad pair: answered again.
+        await d.act(action="setQueue", tracks=q, index=3, play=True, shuffle=True,
+                    order=[3, 0, 1, 2, 4, 5])
+        await d.act(action="setQueue", tracks=q, index=3, play=True, shuffle=True, order=bad)
+        n = sum(1 for x in d.dos if x.get("cmd") == "setShuffle")
+        if n != 2:
+            failures.append(f"repeated bad order: after a valid publish the bad pair got "
+                            f"{n - 1} more answers; expected 1")
+
+        # Removing the playing row when it is LAST in play order (no repeat).
+        await d.act(action="setQueue", tracks=rows("z", 4), index=2, play=True, shuffle=True,
+                    order=[0, 1, 3, 2])
+        d.clear()
+        await c.act(action="remove", index=2)
+        cmds = [x.get("cmd") for x in d.dos]
+        if "pause" not in cmds or "jump" not in cmds or cmds.index("pause") < cmds.index("jump"):
+            failures.append(f"remove last of play order: D got {cmds}; expected queueChanged, "
+                            f"jump, then pause")
+        if c.session.get("isPlaying") is not False:
+            failures.append(f"remove last of play order: session isPlaying "
+                            f"{c.session.get('isPlaying')!r}")
+    finally:
+        hub.terminate()
+        try:
+            hub.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            hub.kill()
+        for p in (state, state + ".bak"):
+            try:
+                os.unlink(p)
+            except FileNotFoundError:
+                pass
 
 
 async def main():
@@ -349,7 +518,6 @@ async def main():
         if not ld or set(ld) != {"t", "cmd", "tracks", "index", "positionMs", "play"}:
             failures.append(f"back-compat: O's load keys {sorted(ld or {})}")
 
-        source_guard(failures)
     finally:
         hub.terminate()
         try:
@@ -362,6 +530,9 @@ async def main():
             except FileNotFoundError:
                 pass
 
+    source_guard(failures)
+    insert_rule(failures)
+    await review_cases(failures)
     if failures:
         print("FAIL:")
         for f in failures:
