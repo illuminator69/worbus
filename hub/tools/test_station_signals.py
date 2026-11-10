@@ -99,6 +99,33 @@ def judgements(log_path):
     return [(int(i), j, v, not h) for i, j, v, _e, h in found]
 
 
+def jump_target(n: int, x: int, order: list) -> int:
+    """Step 8's jump: an index that is NOT next in play order after `x`, preferring
+    x's index neighbour (the track a sequential queue would play next)."""
+    pos = order.index(x) if x in order else 0
+    return next(i for i in range(n) if i != x
+                and i != order[(pos + 1) % len(order)] and abs(i - x) == 1)
+
+
+def jump_target_selfcheck(failures) -> None:
+    """B-258: every order the hub's shuffle can make must give step 8 a target. The
+    hub's order starts at the current track and is otherwise random, so walk all of
+    them for a small queue, `x` being the track after the first."""
+    import itertools
+    n = 5
+    for rest in itertools.permutations(range(1, n)):
+        order = [0, *rest]
+        x = order[1]
+        try:
+            y = jump_target(n, x, order)
+        except StopIteration:
+            failures.append(f"step 8 has no jump target for x={x}, order {order}")
+            return
+        if y in (x, order[(order.index(x) + 1) % n]):
+            failures.append(f"step 8's target {y} is x or next in play order: {order}")
+            return
+
+
 async def settle(t=0.35):
     await asyncio.sleep(t)
 
@@ -248,9 +275,7 @@ async def session_suite(failures, log_path):
         if x != (order[1] if len(order) > 1 else None) or c.rev(sid) != rev0 + 6:
             failures.append(f"next under shuffle was not a skip: index {x}, order {order}, "
                             f"rev {c.rev(sid)}")
-        pos = order.index(x) if x in order else 0
-        y = next(i for i in range(len(queue)) if i != x
-                 and i != order[(pos + 1) % len(order)] and abs(i - x) == 1)
+        y = jump_target(len(queue), x, order)
         await c.act(action="jump", index=y)    # the neighbour by index, not by play order
         await settle()
         if c.rev(sid) != rev0 + 6:
@@ -519,6 +544,9 @@ async def main():
     failures: list[str] = []
     log_path = tempfile.NamedTemporaryFile(suffix=".log", delete=False).name
     try:
+        jump_target_selfcheck(failures)
+        if failures:
+            raise SystemExit(f"FAIL (station signals): {failures}")
         await session_suite(failures, log_path)
         log_checks(failures, log_path)
         await timeout_suite(failures)
