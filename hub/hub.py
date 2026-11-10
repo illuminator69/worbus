@@ -2148,6 +2148,17 @@ def _request_caller(headers: Any) -> Optional[Caller]:
     return None
 
 
+# A report's `moveCause` (PROTOCOL §5.3): why the index it carries differs from the
+# last one. Any other value is read as absent, so a later device's new word is
+# judged as an older device's report is, by position.
+MOVE_CAUSES = frozenset({"user", "end", "error"})
+
+
+def _move_cause(msg: dict) -> Optional[str]:
+    cause = msg.get("moveCause")
+    return cause if isinstance(cause, str) and cause in MOVE_CAUSES else None
+
+
 def _single_flight(inflight: dict, key: Any, work: Any) -> "asyncio.Future":
     """Join the call `key` already in flight, or start `work()` as one.
 
@@ -6987,7 +6998,8 @@ class UserSpace:
 
     def _judge_departure(self, left: int, new: Optional[int], pos_ms: int, *,
                          ended: bool = False, steer: bool = True,
-                         playing: Optional[bool] = None) -> None:
+                         playing: Optional[bool] = None,
+                         cause: Optional[str] = None) -> None:
         """Judge the track at `left`, which playback is leaving (PROTOCOL §18.3).
 
         `pos_ms` is where it was left: for a report, the position of the report
@@ -7003,6 +7015,12 @@ class UserSpace:
         the play state before the report being read). A `next` pressed on a paused
         or restored session carries a position nobody is listening at, and read as
         a skip it cooled an artist the user never heard.
+
+        `cause` is the moving report's `moveCause` (PROTOCOL §5.3), already read by
+        `_move_cause`: a skip is the user's act, so a move the player made itself
+        (`end`, `error`) is never one (B-316: an unplayable file left at 0:00 cooled
+        its artist). None (an act, an older device, a value not known here) is
+        judged by position alone, as before.
         """
         s = self.session
         if not 0 <= left < len(s.queue) or not isinstance(s.queue[left], dict):
@@ -7018,14 +7036,15 @@ class UserSpace:
             pos >= STATION_PLAYED_FRACTION * dur
             or (dur - pos < STATION_PLAYED_TAIL_MS and pos >= 0.5 * dur)))
         skip_below = min(STATION_SKIP_MS, STATION_SKIP_FRACTION * dur) if dur else STATION_SKIP_MS
-        skipped = (not played and new is not None and new == self._next_in_order(left)
-                   and pos < skip_below)
+        skipped = (not played and cause in (None, "user") and new is not None
+                   and new == self._next_in_order(left) and pos < skip_below)
         is_play = played or pos >= STATION_PLAY_MS or (
             dur > 0 and pos >= STATION_PLAY_FRACTION * dur)
         verdict = "played" if played else "skip" if skipped else None
         dlog(f"STATION judged index {left} -> {new}: {verdict or 'neither'} "
              f"at {pos}/{dur} ms{' (ended)' if ended else ''}"
-             f"{'' if steer else ' (history only)'}")
+             f"{'' if steer else ' (history only)'}"
+             f"{f' (cause {cause})' if cause else ''}")
         try:
             self.stations.departure(track, verdict, is_play, steer,
                                     occurrence=f"{s.saved_queue_id}:{left}")
@@ -8285,7 +8304,8 @@ class UserSpace:
                     dlog(f"REPORT idx={idx} from {who} "
                          f"IGNORED(index-grace; session is at {s.index})")
                 else:
-                    self._judge_departure(s.index, idx, left_at, playing=was_playing)
+                    self._judge_departure(s.index, idx, left_at, playing=was_playing,
+                                          cause=_move_cause(msg))
                     s.index = idx; changed = True
         if "isPlaying" in msg and msg["isPlaying"] != s.is_playing:
             playing = bool(msg["isPlaying"])
