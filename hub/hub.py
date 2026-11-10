@@ -7940,10 +7940,11 @@ class UserSpace:
         order = self.session.order
         if order is None or count <= 0:
             return  # sequential order; nothing to track
-        # The rule (design §2, controller ruling 2026-11-10), rows in the order given:
-        # Play next right after the current row; an append (at the end of the
-        # queue) at the end of play order; an insert into the middle of the queue
-        # right after its queue predecessor's play position (first when it has none).
+        # The rule (design §2, controller rulings 2026-11-10), rows in the order
+        # given: Play next right after the current row; an append (at the end of
+        # the queue) at the end of play order; an insert into the middle of the
+        # queue right after its queue predecessor's play position, and one above
+        # the first row right before its queue successor's.
         n_old = len(order)
         new_order = [v + count if v >= at else v for v in order]
         new_vals = list(range(at, at + count))
@@ -7955,7 +7956,7 @@ class UserSpace:
         elif at >= n_old:
             pos = len(new_order)
         elif at <= 0:
-            pos = 0
+            pos = new_order.index(count)  # old row 0, shifted by the insert
         else:
             pos = new_order.index(at - 1) + 1  # row at-1 sits before the insert: unshifted
         new_order[pos:pos] = new_vals
@@ -8542,8 +8543,14 @@ class UserSpace:
             s.queue = msg.get("tracks", [])
             s.index = self._clamp_index(int(msg.get("index", 0)))
             s.position_ms = max(0, int(msg.get("positionMs", 0)))
-            s.is_playing = bool(msg.get("play", True))
-            self._mark_play_intent()
+            # Only a CHANGE of play state is an intent the reports must not undo for
+            # INTENT_GRACE. The playing device republishes on every edit (paused
+            # too), and a mark there made the play or pause pressed on it right
+            # after read wrong for 2 s.
+            playing = bool(msg.get("play", True))
+            if playing != s.is_playing:
+                self._mark_play_intent()
+            s.is_playing = playing
             # Play order (design §1, §3). The playing `playOrder` device (or the one
             # this act promotes) says what it plays and in which order; from anyone
             # else the keys mean nothing and the hub proposes a current-first order,
