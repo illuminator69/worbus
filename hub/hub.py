@@ -2148,6 +2148,31 @@ def _request_caller(headers: Any) -> Optional[Caller]:
     return None
 
 
+def _single_flight(inflight: dict, key: Any, work: Any) -> "asyncio.Future":
+    """Join the call `key` already in flight, or start `work()` as one.
+
+    The shared work runs as its own task, which no caller owns: every caller, the
+    first included, awaits it shielded. The first caller used to run it inline and
+    hand whatever ended it to everyone who joined, so ITS cancellation (a handshake
+    deadline, a client hanging up) became every follower's answer (B-241). Now a
+    caller's cancellation ends only that caller's wait; the work finishes and its
+    result (or its own error) reaches whoever is still waiting. The task context is
+    the first caller's (its `_CALLER`), which is why the key must carry anything an
+    answer varies by. `work` is a zero-argument callable returning a coroutine."""
+    task = inflight.get(key)
+    if task is None or task.done():
+        task = asyncio.ensure_future(work())
+        inflight[key] = task
+
+        def _done(t: "asyncio.Future", key: Any = key) -> None:
+            if inflight.get(key) is t:
+                inflight.pop(key, None)
+            if not t.cancelled():
+                t.exception()   # retrieved: a failure nobody waits for is not logged
+        task.add_done_callback(_done)
+    return asyncio.shield(task)
+
+
 class HttpProxy:
     """Route table + auth + concurrency cap + shared result cache.
 
@@ -2184,6 +2209,7 @@ class HttpProxy:
         # Identical GETs in flight at once share one upstream call. Two devices
         # opening the same source sheet used to start two slskd searches; the
         # cache only ever helped the second caller once the first had returned.
+        # See `_single_flight`: no caller owns the shared call.
         self._inflight: dict[str, asyncio.Future] = {}
 
     # ----- per-upstream ---------------------------------------------------- #
@@ -2468,27 +2494,12 @@ class HttpProxy:
         # a write (or before the listens import ended) gets the earlier answer.
         coalesce = (spec["method"] == "GET" and not refresh
                     and spec.get("coalesce", True))
-        leader = self._inflight.get(key) if coalesce else None
-        if leader is not None:
-            # Shielded: a follower being cancelled must not cancel the shared call.
-            return await asyncio.shield(leader)
-        fut: Optional[asyncio.Future] = None
-        if coalesce:
-            fut = asyncio.get_running_loop().create_future()
-            self._inflight[key] = fut
-        try:
-            result = await self._call_upstream(route, spec, upstream_path, params,
-                                               body, key)
-            if fut is not None:
-                fut.set_result(result)
-            return result
-        except BaseException as e:
-            if fut is not None and not fut.done():
-                fut.set_exception(e)
-            raise
-        finally:
-            if fut is not None:
-                self._inflight.pop(key, None)
+        if not coalesce:
+            return await self._call_upstream(route, spec, upstream_path, params,
+                                             body, key)
+        return await _single_flight(
+            self._inflight, key,
+            lambda: self._call_upstream(route, spec, upstream_path, params, body, key))
 
     async def _call_upstream(self, route: tuple[str, str], spec: dict,
                              upstream_path: str, params: list[tuple[str, str]],
@@ -5951,44 +5962,34 @@ class MoodService:
 
     # ----- searches --------------------------------------------------------- #
     async def _fetch(self, prompt: str) -> Optional[list]:
-        """One search, single-flight per prompt. Stored only on a 200 with rows."""
-        fut = self._inflight.get(prompt)
-        if fut is not None:
-            return await asyncio.shield(fut)
-        fut = asyncio.get_running_loop().create_future()
-        self._inflight[prompt] = fut
+        """One search, single-flight per prompt (`_single_flight`: a caller's
+        cancellation never ends the search). Stored only on a 200 with rows."""
+        return await _single_flight(self._inflight, prompt,
+                                    lambda: self._search_once(prompt))
+
+    async def _search_once(self, prompt: str) -> Optional[list]:
         rows: Optional[list] = None
-        try:
-            route, spec = SONIC_INTERNAL["clap_search"]
-            async with self._sem:
-                status, raw, _ct = await SONIC.call(
-                    route, spec, [], {"query": prompt, "limit": MOOD_LIST_RAW})
-            if status == 200:
-                try:
-                    rows = _clap_rows(json.loads(raw or b"null"))
-                except Exception:  # noqa: BLE001 — not JSON: a failed search
-                    rows = None
-                if rows is not None and not rows:
-                    # A 200 with nothing in it (CLAP index still loading, a prompt
-                    # it could not embed) is not an answer: stored, it would make
-                    # an empty "ready" mood and a station with no songs.
-                    rows = None
-                    dlog("moods: a search answered no rows")
-            if rows is None:
-                self._note_failure(status, raw)
-                dlog(f"moods: a search failed ({status})")
-            else:
-                self._searches[prompt] = (time.monotonic(), rows)
-            fut.set_result(rows)
-            return rows
-        except BaseException as e:
-            if not fut.done():
-                fut.set_exception(e)
-            raise
-        finally:
-            self._inflight.pop(prompt, None)
-            if fut.done() and not fut.cancelled():
-                fut.exception()   # retrieved, so a failure with no follower is not logged
+        route, spec = SONIC_INTERNAL["clap_search"]
+        async with self._sem:
+            status, raw, _ct = await SONIC.call(
+                route, spec, [], {"query": prompt, "limit": MOOD_LIST_RAW})
+        if status == 200:
+            try:
+                rows = _clap_rows(json.loads(raw or b"null"))
+            except Exception:  # noqa: BLE001 — not JSON: a failed search
+                rows = None
+            if rows is not None and not rows:
+                # A 200 with nothing in it (CLAP index still loading, a prompt
+                # it could not embed) is not an answer: stored, it would make
+                # an empty "ready" mood and a station with no songs.
+                rows = None
+                dlog("moods: a search answered no rows")
+        if rows is None:
+            self._note_failure(status, raw)
+            dlog(f"moods: a search failed ({status})")
+        else:
+            self._searches[prompt] = (time.monotonic(), rows)
+        return rows
 
     async def _search(self, prompt: str) -> Optional[list]:
         hit = self._searches.get(prompt)
