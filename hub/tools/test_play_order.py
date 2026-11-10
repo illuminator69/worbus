@@ -540,7 +540,7 @@ async def main():
         sys.exit(1)
     print("PASS - play order: the hub steps the playing device's published order "
           "(next/previous, remove, enqueue, transfer, orphan takeover); controllers' "
-          "keys ignored; bad orders counted and answered; 0.7.0 frames unchanged")
+          "keys ignored; bad orders counted and answered once; never shuffle without an order; insert rule; end-of-order remove pauses; 0.7.0 frames unchanged")
 
 
 def _inherited_env() -> dict:

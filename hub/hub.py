@@ -906,8 +906,40 @@ class Session:
         }
 
     def bump(self) -> None:
+        # Every change to the session passes here, so this is where the order is
+        # made to fit the queue and the mode it travels with.
+        self.ensure_order()
         self.rev += 1
         self.updated_at = int(time.time() * 1000)
+
+    def rebuild_order(self) -> None:
+        """A fresh shuffle of the queue's rows with the current row first (null when
+        not shuffled or nothing is queued)."""
+        n = len(self.queue)
+        if not self.shuffle or n == 0:
+            self.order = None
+            return
+        cur = self.index if 0 <= self.index < n else 0
+        rest = [i for i in range(n) if i != cur]
+        random.shuffle(rest)
+        self.order = [cur] + rest
+
+    def ensure_order(self) -> None:
+        """Under shuffle, `order` is always a permutation of the queue's rows; with
+        shuffle off it is null (design §1). An order that does not fit (none after a
+        `clear` and an enqueue, none in an old state.json, a corrupt one) is replaced
+        by a current-first one, so the hub never steps queue order while the session
+        says shuffle, and never sends `shuffle: true, order: null`."""
+        if not self.shuffle or not self.queue:
+            self.order = None
+        elif not _is_order(self.order, len(self.queue)):
+            self.rebuild_order()
+
+
+def _is_order(order: Any, n: int) -> bool:
+    """A permutation of range(n): every row of the queue exactly once."""
+    return (isinstance(order, list) and len(order) == n
+            and all(type(v) is int for v in order) and sorted(order) == list(range(n)))
 
 
 @dataclass
@@ -6680,6 +6712,8 @@ class UserSpace:
         self.session = Session()
         # Devices already logged for an invalid published play order (W1).
         self._bad_order_logged: set[str] = set()
+        # device id -> (signature of its last bad publish, the order it was sent).
+        self._bad_order_last: dict[str, tuple] = {}
         self.devices: dict[str, Device] = {}
         # Rolling saved-queue history (Continue Listening), authoritative for this user.
         # Keyed by record id; capped at SAVED_QUEUES_MAX, oldest by updatedAt evicted.
@@ -6808,6 +6842,8 @@ class UserSpace:
                 source_name=s.get("sourceName"),
                 station_id=_as_str(s.get("stationId"), 64),
             )
+            # An older state.json may hold shuffle on and no usable order.
+            self.session.ensure_order()
 
         def saved_queues() -> None:
             # Saved-queue history (rolling, capped). Keyed by id for cheap upsert.
@@ -7836,8 +7872,7 @@ class UserSpace:
     @staticmethod
     def _valid_order(order: Any, n: int) -> bool:
         """A permutation of range(n): every row of the frame's queue exactly once."""
-        return (isinstance(order, list) and len(order) == n
-                and all(type(v) is int for v in order) and sorted(order) == list(range(n)))
+        return _is_order(order, n)
 
     def _wire_order(self) -> Optional[list[int]]:
         """The session's order as a `playOrder` device is sent it: null unless
@@ -7863,13 +7898,26 @@ class UserSpace:
         s.shuffle = msg["shuffle"]
         if not s.shuffle or not s.queue:
             s.order = None
+            self._bad_order_last.pop(dev.id, None)
             return True
         order = msg.get("order")
         if self._valid_order(order, len(s.queue)):
             s.order = list(order)
+            self._bad_order_last.pop(dev.id, None)
+            return True
+        self.hub._bad_orders += 1  # noqa: SLF001 — same module
+        # The same bad pair (track ids + order) again from the same device: it was
+        # answered already, so keep the order it was sent and answer nothing. A
+        # client that cannot take the answer would otherwise trade frames with the
+        # hub for as long as its state lasts.
+        sig = (tuple(t.get("id") if isinstance(t, dict) else None for t in s.queue),
+               repr(order))
+        prev = self._bad_order_last.get(dev.id)
+        if prev is not None and prev[0] == sig and self._valid_order(prev[1], len(s.queue)):
+            s.order = list(prev[1])
             return True
         self._rebuild_order()
-        self.hub._bad_orders += 1  # noqa: SLF001 — same module
+        self._bad_order_last[dev.id] = (sig, list(s.order or []))
         if dev.id not in self._bad_order_logged:
             self._bad_order_logged.add(dev.id)
             log(f"{dev.name} ({dev.id[:8]}) published shuffle with an order that is not "
@@ -7880,23 +7928,23 @@ class UserSpace:
     def _rebuild_order(self) -> None:
         """Shuffle queue indices from scratch, keeping the current track first.
 
-        Only for setQueue / shuffle-toggle. Plain queue edits (enqueue/remove/
-        move) must NOT reshuffle — they patch `order` incrementally below so the
-        user's upcoming shuffled order is preserved.
+        Only for setQueue / shuffle-toggle (and, through `Session.ensure_order`, an
+        order that no longer fits). Plain queue edits (enqueue/remove/move) must NOT
+        reshuffle — they patch `order` incrementally below so the user's upcoming
+        shuffled order is preserved.
         """
-        n = len(self.session.queue)
-        if not self.session.shuffle or n == 0:
-            self.session.order = None
-            return
-        rest = [i for i in range(n) if i != self.session.index]
-        random.shuffle(rest)
-        self.session.order = [self.session.index] + rest
+        self.session.rebuild_order()
 
     def _order_after_insert(self, at: int, count: int, play_next: bool) -> None:
         """Patch shuffle order for `count` items inserted at raw position `at`."""
         order = self.session.order
         if order is None or count <= 0:
             return  # sequential order; nothing to track
+        # The rule (design §2, controller ruling 2026-11-10), rows in the order given:
+        # Play next right after the current row; an append (at the end of the
+        # queue) at the end of play order; an insert into the middle of the queue
+        # right after its queue predecessor's play position (first when it has none).
+        n_old = len(order)
         new_order = [v + count if v >= at else v for v in order]
         new_vals = list(range(at, at + count))
         if play_next:
@@ -7904,9 +7952,13 @@ class UserSpace:
                 pos = new_order.index(self.session.index) + 1
             except ValueError:
                 pos = len(new_order)
-            new_order[pos:pos] = new_vals
+        elif at >= n_old:
+            pos = len(new_order)
+        elif at <= 0:
+            pos = 0
         else:
-            new_order.extend(new_vals)
+            pos = new_order.index(at - 1) + 1  # row at-1 sits before the insert: unshifted
+        new_order[pos:pos] = new_vals
         self.session.order = new_order
 
     def _order_after_remove(self, at: int) -> None:
@@ -8590,6 +8642,7 @@ class UserSpace:
             # song, so the active device has to be told to switch to it — queueChanged
             # alone would leave the removed track playing.
             jump_after_remove = False
+            pause_after_remove = False
             if action == "remove":
                 i = int(msg["index"])
                 # Rule 2 (design §2): the playing row's successor is the row after it
@@ -8606,9 +8659,12 @@ class UserSpace:
                         if succ is not None and succ != i and s.queue:
                             s.index = succ - 1 if succ > i else succ
                         else:
-                            # Nothing after it in play order: stop on the last row.
+                            # Nothing after it in play order: stop on the last row,
+                            # and tell the device so (pause below).
                             s.index = s.order[-1] if s.order else 0
                             s.is_playing = False
+                            self._mark_play_intent()
+                            pause_after_remove = True
                         s.position_ms = 0
                         jump_after_remove = True
                     elif i == s.index:
@@ -8642,6 +8698,8 @@ class UserSpace:
                 await self._do(adev, "queueChanged", tracks=s.queue, index=s.index)
                 if jump_after_remove:
                     await self._do(adev, "jump", index=s.index)
+                if pause_after_remove:
+                    await self._do(adev, "pause")
             await self._broadcast_session()
             await self._broadcast_saved_queues()
 
