@@ -880,7 +880,8 @@ async def unit_checks() -> list[str]:
         if (len(timeouts) != 2 or timeouts[0] != hub.LB_PROBE_TIMEOUT
                 or not hub.PROXY_TIMEOUT - 1.0 <= timeouts[1] <= hub.PROXY_TIMEOUT):
             failures.append(f"probe timeouts (health, fallback) = {timeouts!r}, expected "
-                            f"[{hub.LB_PROBE_TIMEOUT}, {hub.PROXY_TIMEOUT}]")
+                            f"[{hub.LB_PROBE_TIMEOUT}, {hub.PROXY_TIMEOUT - 1.0} .. "
+                            f"{hub.PROXY_TIMEOUT}]")
         if not hub.LB_PROBE_TIMEOUT <= 5:
             failures.append(f"LB_PROBE_TIMEOUT = {hub.LB_PROBE_TIMEOUT}; a hanging lb-bot must "
                             "read as down within seconds")
