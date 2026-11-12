@@ -2235,8 +2235,8 @@ def _single_flight(inflight: dict, key: Any, work: Any) -> Any:
     the first caller's (its `_CALLER`), which is why the key must carry anything an
     answer varies by. `work` is a zero-argument callable returning a coroutine.
 
-    The task never ends in an exception: it returns `(ok, value_or_error)` and each
-    waiter re-raises the error. A failure nobody waits for any more is then silent
+    The task never ends in an exception: it returns `(ok, value_or_error, tb)` and
+    each waiter re-raises the error with the work's own traceback. A failure nobody waits for any more is then silent
     on every Python: on 3.13+ `asyncio.shield` itself logs "exception in shielded
     future" for an inner task that fails after its outer was cancelled, whatever a
     done callback retrieves (3.12, the images' Python, does not). A cancellation of
@@ -2245,9 +2245,9 @@ def _single_flight(inflight: dict, key: Any, work: Any) -> Any:
     if task is None or task.done():
         async def run() -> tuple:
             try:
-                return True, await work()
+                return True, await work(), None
             except Exception as e:  # noqa: BLE001 — handed to every waiter
-                return False, e
+                return False, e, e.__traceback__
         task = asyncio.ensure_future(run())
         inflight[key] = task
 
@@ -2259,10 +2259,12 @@ def _single_flight(inflight: dict, key: Any, work: Any) -> Any:
 
 
 async def _single_flight_wait(task: "asyncio.Future") -> Any:
-    ok, value = await asyncio.shield(task)
+    ok, value, tb = await asyncio.shield(task)
     if ok:
         return value
-    raise value
+    # The work's own traceback each time: a bare re-raise of the one shared
+    # exception appended every earlier waiter's frame to it.
+    raise value.with_traceback(tb)
 
 
 class HttpProxy:
