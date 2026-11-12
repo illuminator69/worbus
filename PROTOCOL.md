@@ -2859,6 +2859,8 @@ an advert from before a reconnect) treats the first such 409 as the off state: n
 When the hub relays a 409 `downloads_off`, it reads lb-bot's health at once and sends `t:"lb"` with the
 result to the asking user's devices, whether or not its own view changed (a change goes to every user, as
 always), so a client that went "off" on a 409 hears "on" again without waiting for its next welcome (B-298).
+One such read is pending per user at a time, and the same frame goes to a user at most once every 2 s
+(`LB_TELL_MIN_INTERVAL`), so a client that keeps getting the 409 does not flood its user's devices.
 Read-only routes answer as usual with empty download sections; the wishlist (`/lb/wishlist*`) works in both
 modes.
 

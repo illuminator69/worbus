@@ -396,6 +396,9 @@ LB_IDENTITY_PROOF_MAX_S = float(os.environ.get("HUB_LB_IDENTITY_PROOF_MAX_S", "1
 # bounded this tightly — the `/api/summary` fallback for an older lb-bot is a
 # genuinely heavy read and keeps the route's own timeout.
 LB_PROBE_TIMEOUT = 4.0
+# B-298: the least time between two identical `lb` frames a relayed 409
+# `downloads_off` sends one space (`LbProxy._downloads_off_seen`).
+LB_TELL_MIN_INTERVAL = 2.0
 # The least a route's 404 fallback is given when the first call used up (nearly) all
 # of the route's timeout (`HttpProxy._fetch_with`).
 FALLBACK_MIN_TIMEOUT = 1.0
@@ -2909,6 +2912,11 @@ class LbProxy(HttpProxy):
         self._refused_logged_at = -math.inf
         self._probed = asyncio.Event()
         self._announcing: set[asyncio.Task] = set()
+        # B-298's tells (`_downloads_off_seen`), per space key: the one pending, and
+        # the last frame sent with when, so a client looping on a 409 does not send
+        # every device of its space one identical frame per request.
+        self._tells: dict[str, asyncio.Task] = {}
+        self._told: dict[str, tuple[float, dict]] = {}
 
     @property
     def upstream(self) -> str:
@@ -3271,6 +3279,11 @@ class LbProxy(HttpProxy):
         caller = _CALLER.get()
         hub = HUB_INSTANCE
         key = _space_key(caller.user) if caller is not None else ""
+        pending = self._tells.get(key)
+        if pending is not None and not pending.done():
+            # One tell per space at a time: the pending one answers this 409 too
+            # (its probe is the one this would have joined).
+            return
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -3286,12 +3299,27 @@ class LbProxy(HttpProxy):
                     pass
             after = self.welcome_info()
             space = hub.spaces.get(key) if hub is not None and key else None
-            if after == before and space is not None:
-                await hub._broadcast_space(space, {"t": "lb", **after})  # noqa: SLF001
+            if after != before or space is None:
+                return
+            frame = {"t": "lb", **after}
+            now = time.monotonic()
+            last = self._told.get(key)
+            if last is not None and last[1] == frame and now - last[0] < LB_TELL_MIN_INTERVAL:
+                # The same frame reached every device of this space a moment ago
+                # (a device that connected since read it in its welcome).
+                return
+            self._told[key] = (now, frame)
+            await hub._broadcast_space(space, frame)  # noqa: SLF001
 
         task = loop.create_task(tell())
+        self._tells[key] = task
         self._announcing.add(task)
         task.add_done_callback(self._announcing.discard)
+
+        def _forget(t: asyncio.Task, key: str = key) -> None:
+            if self._tells.get(key) is t:
+                self._tells.pop(key, None)
+        task.add_done_callback(_forget)
 
     def augment(self, spec: dict, status: int, data: bytes) -> tuple[int, bytes, str]:
         """`/lb/status` is the liveness probe, and only the reachability verdict is
