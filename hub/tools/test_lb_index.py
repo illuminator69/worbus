@@ -872,10 +872,13 @@ async def unit_checks() -> list[str]:
             hub.log = original_log
 
         # ----- the probe's own health call is short; the fallback is not -- #
+        # (Since partial review 5 the fallback gets what is LEFT of the route's
+        # timeout, so after an instant 404 it is the route's timeout less a moment.)
         timeouts.clear()
         answers.extend([404, 200])
         await lb.probe()
-        if timeouts != [hub.LB_PROBE_TIMEOUT, hub.PROXY_TIMEOUT]:
+        if (len(timeouts) != 2 or timeouts[0] != hub.LB_PROBE_TIMEOUT
+                or not hub.PROXY_TIMEOUT - 1.0 <= timeouts[1] <= hub.PROXY_TIMEOUT):
             failures.append(f"probe timeouts (health, fallback) = {timeouts!r}, expected "
                             f"[{hub.LB_PROBE_TIMEOUT}, {hub.PROXY_TIMEOUT}]")
         if not hub.LB_PROBE_TIMEOUT <= 5:
