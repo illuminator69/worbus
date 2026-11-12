@@ -209,17 +209,9 @@ class AudioMuse(http.server.BaseHTTPRequestHandler):
             return self._send(200, {"clap_enabled": True, "loaded": True,
                                     "song_count": len(LIB)})
         if path == "/api/sonic_fingerprint/generate":
-            if AM["slow_fp"]:
-                time.sleep(AM["slow_fp"])
-            if q.get("navidrome_user") == ND_USER and q.get("navidrome_password") == ND_PASS:
-                with AM["lock"]:
-                    AM["creds_seen"] += 1
-            n = int(q.get("n", "10"))
-            top = [LIB["L05_0"], LIB["L06_0"], LIB["L07_0"]]
-            rows = [_row(t, 0.0) for t in top]
-            rows += [_row(o, d + 0.05) for d, o in _near("L05_0", n - 3)
-                     if o["id"] not in {t["id"] for t in top}]
-            return self._send(200, rows[:n])
+            # AudioMuse takes GET too, but the hub POSTs (the account in the body,
+            # never the URL): an account in this query is not counted.
+            return self._fingerprint(q, with_creds=False)
         if path == "/api/similar_artists":
             # Lures: an aggressive artist first, then an electronic one.
             return self._send(200, [
@@ -243,11 +235,29 @@ class AudioMuse(http.server.BaseHTTPRequestHandler):
             return self._send(200, row)
         return self._send(404, {"error": "not found"})
 
+    def _fingerprint(self, q, with_creds):
+        if AM["slow_fp"]:
+            time.sleep(AM["slow_fp"])
+        if (with_creds and q.get("navidrome_user") == ND_USER
+                and q.get("navidrome_password") == ND_PASS):
+            with AM["lock"]:
+                AM["creds_seen"] += 1
+        n = int(q.get("n", 10))
+        top = [LIB["L05_0"], LIB["L06_0"], LIB["L07_0"]]
+        rows = [_row(t, 0.0) for t in top]
+        rows += [_row(o, d + 0.05) for d, o in _near("L05_0", n - 3)
+                 if o["id"] not in {t["id"] for t in top}]
+        return self._send(200, rows[:n])
+
     def do_POST(self):  # noqa: N802
         length = int(self.headers.get("Content-Length") or 0)
         body = json.loads(self.rfile.read(length) or b"{}")
         with AM["lock"]:
             AM["calls"].append((self.path, body))
+        if self.path == "/api/sonic_fingerprint/generate":
+            if self.headers.get("Authorization") != "Bearer am-token":
+                return self._send(401, {"error": "token"})
+            return self._fingerprint(body if isinstance(body, dict) else {}, with_creds=True)
         if self.path == "/api/clap/search" and AM["clap_on"]:
             q, limit = body.get("query"), int(body.get("limit") or 100)
             if q in AM["clap_fail"]:

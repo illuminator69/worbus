@@ -1195,7 +1195,8 @@ def _nd_native_blocking(method: str, path: str, body: Optional[dict] = None,
 #     body:      allowed top-level JSON body keys (POST)
 #     path_args: keys lifted out of params/body and interpolated into `path`
 #                (for upstream routes that put an id in the URL)
-#     nd:        inject HUB_ND_USER/HUB_ND_PASS (only the fingerprint route needs them)
+#     nd:        send HUB_ND_USER/HUB_ND_PASS (only the fingerprint route needs them):
+#                upstream as a POST with a JSON body (`_nd_body`), never in a URL
 #     cache:     cacheable; `ttl` overrides PROXY_CACHE_TTL
 #     timeout:   overrides PROXY_TIMEOUT for a known-slow upstream
 #     pool:      "default" (absent), "fast" or "sync" — see PROXY_*_INFLIGHT
@@ -2165,6 +2166,29 @@ def _move_cause(msg: dict) -> Optional[str]:
     return cause if isinstance(cause, str) and cause in MOVE_CAUSES else None
 
 
+def _upstream_method(spec: dict) -> str:
+    """The method the upstream is called with: `spec["method"]`, except that a route
+    marked `nd` is always a POST (its body carries the service account, `_nd_body`)."""
+    return "POST" if spec.get("nd") else spec["method"]
+
+
+def _nd_body(params: list[tuple[str, str]]) -> dict:
+    """The JSON body of a route marked `nd` (AudioMuse's fingerprint): the route's
+    params (`n` as an int when it is one) plus HUB_ND_USER / HUB_ND_PASS as
+    `navidrome_user` / `navidrome_password`, the names AudioMuse reads from a GET
+    query or, since at least 3.7.1, a POST body. The core reads that account's
+    Navidrome play history; the hub holds it already (savePlayQueue mirror), and
+    clients never send it. In a URL it lands in AudioMuse's access log and any
+    proxy's (the hub half of B-359)."""
+    out: dict = {}
+    for k, v in params:
+        out[k] = int(v) if k == "n" and v.isdigit() else v
+    if ND_USER and ND_PASS:
+        out["navidrome_user"] = ND_USER
+        out["navidrome_password"] = ND_PASS
+    return out
+
+
 def _single_flight(inflight: dict, key: Any, work: Any) -> Any:
     """Join the call `key` already in flight, or start `work()` as one. Returns an
     awaitable of its result.
@@ -2430,13 +2454,10 @@ class HttpProxy:
     @staticmethod
     def _filtered_params(spec: dict, query: str) -> list[tuple[str, str]]:
         allowed = spec.get("params") or ()
-        out = [(k, v) for k, v in urllib.parse.parse_qsl(query, keep_blank_values=False)
-               if k in allowed]
-        if spec.get("nd") and ND_USER and ND_PASS:
-            # The core reads Navidrome play history for the fingerprint. The hub holds
-            # these already (savePlayQueue mirror) — clients never send them.
-            out += [("navidrome_user", ND_USER), ("navidrome_password", ND_PASS)]
-        return out
+        # A route marked `nd` gets the service account in its upstream POST body
+        # (`_nd_body`, at the upstream call), never here: these params become a URL.
+        return [(k, v) for k, v in urllib.parse.parse_qsl(query, keep_blank_values=False)
+                if k in allowed]
 
     @staticmethod
     def _upstream_path(spec: dict, params: list[tuple[str, str]],
@@ -2540,6 +2561,10 @@ class HttpProxy:
                              upstream_path: str, params: list[tuple[str, str]],
                              body: Optional[dict], key: str) -> tuple[int, bytes, str]:
         gen = self._cache_gen.get(route, 0)
+        if spec.get("nd"):
+            # Asked as a GET with `?n=`, sent upstream as a POST whose body carries
+            # the params and the service account (`_nd_body`): never in a URL.
+            params, body = [], _nd_body(params)
         url = self.upstream + upstream_path
         # nd creds are injected here, not logged: keep them out of the cache key too.
         if params:
@@ -2627,8 +2652,9 @@ class HttpProxy:
                           payload: Optional[bytes], timeout: Optional[float],
                           timeout_route: float) -> tuple[int, bytes, str]:
         started = time.monotonic()
+        method = _upstream_method(spec)
         result = await asyncio.to_thread(
-            _proxy_upstream_blocking, spec["method"], self.upstream + upstream_path + query,
+            _proxy_upstream_blocking, method, self.upstream + upstream_path + query,
             payload, self.upstream_token,
             timeout if timeout is not None else timeout_route, self.label)
         if result[0] == 404 and spec.get("fallback"):
@@ -2641,7 +2667,7 @@ class HttpProxy:
             # floor, also when every caller has left (B-241: the work runs on).
             left = timeout_route - (time.monotonic() - started)
             result = await asyncio.to_thread(
-                _proxy_upstream_blocking, spec["method"],
+                _proxy_upstream_blocking, method,
                 self.upstream + spec["fallback"] + query,
                 payload, self.upstream_token, max(FALLBACK_MIN_TIMEOUT, left), self.label)
         return result
@@ -4519,7 +4545,7 @@ class StationEngine:
         not in AudioMuse's index), and the callers that expect one clear it."""
         route, spec = SONIC_INTERNAL[name]
         query = urllib.parse.urlencode(params or {})
-        plist = HttpProxy._filtered_params(spec, query)  # adds the nd creds where the spec says
+        plist = HttpProxy._filtered_params(spec, query)  # an `nd` route's account goes in its body
         async with (b.sem if b is not None else _NullAsync()):
             result = await self._await_bounded(SONIC.call(route, spec, plist, body), b)
         if result is None:
