@@ -10675,7 +10675,14 @@ def startup_config_refusal(token: str, host: str, allow_insecure_no_auth: bool,
     if _is_example_secret(token):
         return ("HUB_TOKEN is still the example value; set your own "
                 "(for example `openssl rand -hex 16`).")
-    if not token.strip():  # whitespace only is as empty as empty
+    if not _unquote(token):  # whitespace only, or empty quotes, is as empty as empty
+        if token.strip():
+            # `""` / `''` (`docker run --env-file` keeps quotes literally): its
+            # author meant empty, and the hub would take the two quote characters
+            # as its token, a public one. Refused in the loopback no-auth mode too,
+            # which would otherwise authenticate against that literal.
+            return ("HUB_TOKEN is set to empty quotes; set your own "
+                    "(for example `openssl rand -hex 16`), or leave it unset.")
         if not allow_insecure_no_auth:
             return (
                 "HUB_TOKEN is not set.\n"
@@ -10695,7 +10702,7 @@ def startup_config_refusal(token: str, host: str, allow_insecure_no_auth: bool,
         if _is_example_secret(preview_secret):
             return ("PREVIEW_SECRET is still the example value; set your own "
                     "(for example `openssl rand -hex 16`).")
-        if not preview_secret.strip():
+        if not _unquote(preview_secret):  # empty quotes are empty (review finding 3)
             return ("PREVIEW_SECRET is not set but PREVIEW_URL is; set your own "
                     "(for example `openssl rand -hex 16`), or unset PREVIEW_URL.")
         # Only the hub holds both (B-312). HUB_TOKEN is the whole administrative

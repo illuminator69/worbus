@@ -770,7 +770,7 @@ def secret_refusal(value: str) -> Optional[str]:
                 "The example is public: anyone could sign a /stream URL with it, "
                 "which makes this an open media relay pointed at a third-party "
                 "extractor.")
-    if not value.strip():
+    if not v:  # judged after the quotes, as the hub does: `""` is empty
         return ("PREVIEW_SECRET is not set.\n"
                 "/stream is authorised by an HMAC capability in the URL, because a "
                 "Chromecast sends no headers. Without a secret every signature "
