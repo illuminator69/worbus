@@ -2159,8 +2159,9 @@ def _move_cause(msg: dict) -> Optional[str]:
     return cause if isinstance(cause, str) and cause in MOVE_CAUSES else None
 
 
-def _single_flight(inflight: dict, key: Any, work: Any) -> "asyncio.Future":
-    """Join the call `key` already in flight, or start `work()` as one.
+def _single_flight(inflight: dict, key: Any, work: Any) -> Any:
+    """Join the call `key` already in flight, or start `work()` as one. Returns an
+    awaitable of its result.
 
     The shared work runs as its own task, which no caller owns: every caller, the
     first included, awaits it shielded. The first caller used to run it inline and
@@ -2169,19 +2170,36 @@ def _single_flight(inflight: dict, key: Any, work: Any) -> "asyncio.Future":
     caller's cancellation ends only that caller's wait; the work finishes and its
     result (or its own error) reaches whoever is still waiting. The task context is
     the first caller's (its `_CALLER`), which is why the key must carry anything an
-    answer varies by. `work` is a zero-argument callable returning a coroutine."""
+    answer varies by. `work` is a zero-argument callable returning a coroutine.
+
+    The task never ends in an exception: it returns `(ok, value_or_error)` and each
+    waiter re-raises the error. A failure nobody waits for any more is then silent
+    on every Python: on 3.13+ `asyncio.shield` itself logs "exception in shielded
+    future" for an inner task that fails after its outer was cancelled, whatever a
+    done callback retrieves (3.12, the images' Python, does not). A cancellation of
+    the task itself (shutdown) still reaches its waiters as one."""
     task = inflight.get(key)
     if task is None or task.done():
-        task = asyncio.ensure_future(work())
+        async def run() -> tuple:
+            try:
+                return True, await work()
+            except Exception as e:  # noqa: BLE001 — handed to every waiter
+                return False, e
+        task = asyncio.ensure_future(run())
         inflight[key] = task
 
         def _done(t: "asyncio.Future", key: Any = key) -> None:
             if inflight.get(key) is t:
                 inflight.pop(key, None)
-            if not t.cancelled():
-                t.exception()   # retrieved: a failure nobody waits for is not logged
         task.add_done_callback(_done)
-    return asyncio.shield(task)
+    return _single_flight_wait(task)
+
+
+async def _single_flight_wait(task: "asyncio.Future") -> Any:
+    ok, value = await asyncio.shield(task)
+    if ok:
+        return value
+    raise value
 
 
 class HttpProxy:
