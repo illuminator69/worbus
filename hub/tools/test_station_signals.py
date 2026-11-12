@@ -108,6 +108,9 @@ def jump_target(n: int, x: int, order: list) -> int:
     pos = order.index(x) if x in order else 0
     nxt = order[(pos + 1) % len(order)]
     candidates = [i for i in range(n) if i not in (x, nxt)]
+    if not candidates:
+        # Partial review nit 8: a queue of 2 or fewer has no such index at all.
+        raise ValueError(f"a queue of {n} has no index that is neither {x} nor next")
     return next((i for i in candidates if abs(i - x) == 1), candidates[0])
 
 
@@ -122,7 +125,7 @@ def jump_target_selfcheck(failures) -> None:
         x = order[1]
         try:
             y = jump_target(n, x, order)
-        except StopIteration:
+        except (StopIteration, ValueError):
             failures.append(f"step 8 has no jump target for x={x}, order {order}")
             return
         if y in (x, order[(order.index(x) + 1) % n]):
