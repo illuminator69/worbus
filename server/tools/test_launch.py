@@ -14,6 +14,8 @@ clock (its `sleep` advances fake time and yields a few real milliseconds).
   two_primary_accounts_refused     HUB_ND_USER=alice with NAVIDROME_USER=bob -> refusal
                                    naming both settings
   two_secrets_refused              HUB_TOKEN and LB_BOT_HUB_TOKEN set apart -> refusal
+  quoted_empty_is_unset            HUB_TOKEN / LB_BOT_HUB_TOKEN = "" (or '', " ") mint the
+                                   secret for both halves; NAVIDROME_URL="" is not set
   secret_minted_once               64 hex, 0600, the same on the second run; HUB_TOKEN
                                    wins and nothing is written; a malformed file -> refusal
                                    naming the file, the file untouched
@@ -455,6 +457,43 @@ def t_secret_minted_once() -> list[str]:
         path.write_text("c" * 64 + "\n")
         if wl.fill_env(dict(THREE), tmp)["hub"]["HUB_TOKEN"] != "c" * 64:
             f.append("a file with a trailing newline did not read as its 64 characters")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    return f
+
+
+def t_quoted_empty_is_unset() -> list[str]:
+    """Fix-round review nit 7: `docker run --env-file` keeps quotes, so HUB_TOKEN=""
+    reached both halves as the two quote characters (the hub then refuses it, a
+    restart loop). Empty quotes mean unset, as in the hub: the secret is minted, and
+    a quoted-empty required setting is "not set"."""
+    f: list[str] = []
+    for name in ("HUB_TOKEN", "LB_BOT_HUB_TOKEN"):
+        for v in ('""', "''", '" "', ' "" '):
+            tmp = Path(tempfile.mkdtemp(prefix="worbus-fill-"))
+            try:
+                got = wl.fill_env({**THREE, name: v}, tmp)
+                path = tmp / "hub" / "service-secret"
+                raw = path.read_text() if path.exists() else ""
+                if not HEX64.fullmatch(raw):
+                    f.append(f"{name}={v!r}: no secret was minted")
+                elif (got["hub"]["HUB_TOKEN"], got["lb-bot"]["LB_BOT_HUB_TOKEN"]) != (raw, raw):
+                    f.append(f"{name}={v!r}: the halves got "
+                             f"{got['hub']['HUB_TOKEN'][:4]!r}/{got['lb-bot']['LB_BOT_HUB_TOKEN'][:4]!r}, "
+                             "not the minted secret")
+            except wl.ConfigRefusal as e:
+                f.append(f"{name}={v!r}: refused: {e}")
+            finally:
+                shutil.rmtree(tmp, ignore_errors=True)
+    tmp = Path(tempfile.mkdtemp(prefix="worbus-fill-"))
+    try:
+        msg = _refusal({**THREE, "NAVIDROME_URL": '""'}, tmp)
+        if msg is None or "NAVIDROME_URL" not in msg or "not set" not in msg:
+            f.append(f'NAVIDROME_URL="" was not refused as not set: {msg!r}')
+        # A real quoted value is still a value (the halves read it as it is).
+        got = wl.fill_env({**THREE, "HUB_TOKEN": '"' + "e" * 64 + '"'}, tmp)
+        if got["hub"]["HUB_TOKEN"] != '"' + "e" * 64 + '"':
+            f.append("a quoted real HUB_TOKEN was changed")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     return f
@@ -929,6 +968,7 @@ TESTS = (
     ("two_primary_accounts_refused", t_two_primary_accounts_refused),
     ("two_secrets_refused", t_two_secrets_refused),
     ("secret_minted_once", t_secret_minted_once),
+    ("quoted_empty_is_unset", t_quoted_empty_is_unset),
     ("crashed_child_restarts_alone", t_crashed_child_restarts_alone),
     ("five_crashes_stop_container", t_five_crashes_stop_container),
     ("sigterm_order", t_sigterm_order),
