@@ -2709,9 +2709,12 @@ class HttpProxy:
             # and only on a 404 — a 5xx or a timeout is an answer about the
             # service, not about the route, and retrying it would only double
             # the wait before the client hears it. It gets what is LEFT of the
-            # route's timeout (at least FALLBACK_MIN_TIMEOUT), not a second one:
-            # a call holds its pool slot for at most the route timeout plus that
-            # floor, also when every caller has left (B-241: the work runs on).
+            # route's timeout (at least FALLBACK_MIN_TIMEOUT), not a second one.
+            # That bounds a call by about the route timeout plus that floor only
+            # for an upstream that answers: the clock also counts the wait for an
+            # executor thread (which can leave the fallback just the floor), and
+            # urllib's timeout bounds each socket operation, not the whole call, so
+            # an upstream that drips can outlast it (as before this rule).
             left = timeout_route - (time.monotonic() - started)
             result = await asyncio.to_thread(
                 _proxy_upstream_blocking, method,
