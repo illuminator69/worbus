@@ -21,6 +21,11 @@ Cases:
                     non-zero at once, naming PREVIEW_SECRET and never the value
   not_hub_token     the hub refuses PREVIEW_SECRET == HUB_TOKEN with PREVIEW_URL set,
                     naming both settings and neither value; a different secret passes
+  quoted_empty      `""`, `''`, `" "` and `' '` are empty, after the quotes
+                    `docker run --env-file` keeps: the hub and the sidecar refuse each as
+                    PREVIEW_SECRET, and the hub refuses each as HUB_TOKEN (also in the
+                    loopback no-auth mode, which would otherwise take the two quote
+                    characters as its token)
 
 Exits non-zero on failure.
 """
@@ -42,8 +47,10 @@ from test_edits import _free_port  # noqa: E402
 
 TOKEN = "0123456789abcdef0123456789abcdef"
 EXAMPLE = "change-me-to-a-long-random-secret-that-is-not-the-hub-token"
+QUOTED_EMPTY = ['""', "''", '" "', "' '", '  ""  ']
 VALUES = ["", "   ", "change-me", EXAMPLE, "CHANGE-ME-x", f"'{EXAMPLE}'", '"change-me"',
-          "  change-me-x  ", "fedcba9876543210fedcba9876543210", "changeme-not-the-prefix"]
+          "  change-me-x  ", "fedcba9876543210fedcba9876543210", "changeme-not-the-prefix",
+          *QUOTED_EMPTY, '"x"', "'a'"]
 
 
 def hub_refuses(secret: str) -> bool:
@@ -107,17 +114,41 @@ def case_not_hub_token(failures):
         failures.append("not_hub_token: refused with no PREVIEW_URL (no preview proxy)")
 
 
+def case_quoted_empty(failures):
+    rule = getattr(load_preview(), "secret_refusal", None)
+    r = hubmod.startup_config_refusal
+    for v in QUOTED_EMPTY:
+        if not hub_refuses(v):
+            failures.append(f"quoted_empty: the hub accepts PREVIEW_SECRET={v!r}")
+        if rule is not None and not rule(v):
+            failures.append(f"quoted_empty: the sidecar accepts PREVIEW_SECRET={v!r}")
+        got = r(v, "0.0.0.0", False, "", "")
+        if got is None or "HUB_TOKEN" not in got:
+            failures.append(f"quoted_empty: the hub accepts HUB_TOKEN={v!r}: {got!r}")
+        if r(v, "127.0.0.1", True, "", "") is None:
+            failures.append(f"quoted_empty: the loopback no-auth mode runs with "
+                            f"HUB_TOKEN={v!r} as its token")
+    # A one-character real value inside quotes is not empty.
+    if r('"x"', "0.0.0.0", False, "", "") is not None:
+        failures.append("quoted_empty: HUB_TOKEN='\"x\"' was refused as empty")
+    # Truly empty in the loopback no-auth mode is still allowed (unchanged).
+    if r("", "127.0.0.1", True, "", "") is not None:
+        failures.append("quoted_empty: an empty HUB_TOKEN in the loopback no-auth mode "
+                        "is refused")
+
+
 def main() -> int:
     failures: list[str] = []
     case_parity(failures)
     case_sidecar_refuses(failures)
     case_not_hub_token(failures)
+    case_quoted_empty(failures)
     if failures:
         print("FAIL (preview secret rules):")
         for f in failures:
             print("  -", f)
         return 1
-    print("PASS - preview secret rules: parity/sidecar-refuses-example/not-hub-token")
+    print("PASS - preview secret rules: parity/sidecar-refuses-example/not-hub-token/quoted-empty")
     return 0
 
 
