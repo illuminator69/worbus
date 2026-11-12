@@ -13,8 +13,8 @@ In process: `_proxy_upstream_blocking` is a stub that records the timeout each c
 was given and answers the route 404 after a delay.
 
 Cases:
-  fallback_gets_the_rest   primary 404 after 0.6 s on a 1.0 s route: the fallback is
-                           given at most the 0.4 s left (plus the floor), not 1.0 s
+  fallback_gets_the_rest   primary 404 after 2.4 s on a 3.0 s route: the fallback is
+                           given what is left, raised to the floor (1.0 s), not 3.0 s
   fast_404_keeps_budget    a primary 404 at once leaves the fallback ~the whole timeout
   probe_override_kept      the probe's shorter first-call timeout (LB_PROBE_TIMEOUT)
                            does not shorten the fallback below the route's remainder
@@ -54,25 +54,25 @@ async def fetch(spec, timeout=None):
 async def run() -> list[str]:
     f: list[str] = []
     floor = getattr(hub, "FALLBACK_MIN_TIMEOUT", 0.0)
-    spec = {"method": "GET", "path": "/primary", "fallback": "/fallback", "timeout": 1.0}
+    spec = {"method": "GET", "path": "/primary", "fallback": "/fallback", "timeout": 3.0}
 
-    PRIMARY_DELAY[0] = 0.6
+    PRIMARY_DELAY[0] = 2.4
     st, _b, _c = await fetch(spec)
     if st != 200 or len(CALLS) != 2:
         f.append(f"fallback_gets_the_rest: {st}, calls {CALLS}")
     else:
         given = CALLS[1][1]
-        if given > max(0.45, floor) + 1e-6:
+        if given > max(0.6, floor) + 0.05:
             f.append(f"fallback_gets_the_rest: the fallback was given {given:.2f} s after "
-                     f"0.6 s of a 1.0 s route (a second whole timeout)")
+                     f"2.4 s of a 3.0 s route (a second whole timeout)")
 
     PRIMARY_DELAY[0] = 0.0
     await fetch(spec)
-    if len(CALLS) == 2 and CALLS[1][1] < 0.9:
+    if len(CALLS) == 2 and CALLS[1][1] < 2.9:
         f.append(f"fast_404_keeps_budget: an immediate 404 left the fallback {CALLS[1][1]:.2f} s")
 
     await fetch(spec, timeout=0.2)
-    if len(CALLS) == 2 and (CALLS[0][1] != 0.2 or CALLS[1][1] < 0.9):
+    if len(CALLS) == 2 and (CALLS[0][1] != 0.2 or CALLS[1][1] < 2.9):
         f.append(f"probe_override_kept: first {CALLS[0][1]}, fallback {CALLS[1][1]:.2f} s")
     return f
 

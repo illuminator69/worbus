@@ -396,6 +396,9 @@ LB_IDENTITY_PROOF_MAX_S = float(os.environ.get("HUB_LB_IDENTITY_PROOF_MAX_S", "1
 # bounded this tightly — the `/api/summary` fallback for an older lb-bot is a
 # genuinely heavy read and keeps the route's own timeout.
 LB_PROBE_TIMEOUT = 4.0
+# The least a route's 404 fallback is given when the first call used up (nearly) all
+# of the route's timeout (`HttpProxy._fetch_with`).
+FALLBACK_MIN_TIMEOUT = 1.0
 # Until the first probe has answered, a `welcome` waits up to this long for it.
 # Without it, a client reconnecting the instant a restarted hub is listening
 # reads `available: false` from a probe that simply has not answered yet — and
@@ -2623,6 +2626,7 @@ class HttpProxy:
     async def _fetch_with(self, spec: dict, upstream_path: str, query: str,
                           payload: Optional[bytes], timeout: Optional[float],
                           timeout_route: float) -> tuple[int, bytes, str]:
+        started = time.monotonic()
         result = await asyncio.to_thread(
             _proxy_upstream_blocking, spec["method"], self.upstream + upstream_path + query,
             payload, self.upstream_token,
@@ -2631,11 +2635,15 @@ class HttpProxy:
             # The upstream is older than the route: ask the one it has. Once,
             # and only on a 404 — a 5xx or a timeout is an answer about the
             # service, not about the route, and retrying it would only double
-            # the wait before the client hears it.
+            # the wait before the client hears it. It gets what is LEFT of the
+            # route's timeout (at least FALLBACK_MIN_TIMEOUT), not a second one:
+            # a call holds its pool slot for at most the route timeout plus that
+            # floor, also when every caller has left (B-241: the work runs on).
+            left = timeout_route - (time.monotonic() - started)
             result = await asyncio.to_thread(
                 _proxy_upstream_blocking, spec["method"],
                 self.upstream + spec["fallback"] + query,
-                payload, self.upstream_token, timeout_route, self.label)
+                payload, self.upstream_token, max(FALLBACK_MIN_TIMEOUT, left), self.label)
         return result
 
     def refuse_caller(self, caller: Caller) -> Optional[tuple]:
