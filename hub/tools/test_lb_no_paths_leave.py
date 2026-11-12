@@ -213,6 +213,28 @@ class FakeLb(http.server.BaseHTTPRequestHandler):
         pass
 
 
+def non_admin_names(value, at="", in_sources=False) -> list[str]:
+    # Ruling 1 is "the LAST segment", not "a shorter path": a non-admin's
+    # sources[].folder and files[].filename carry no separator at all (fix-round
+    # review nit 5; the marker alone missed a "last two segments" regression).
+    out: list[str] = []
+    if isinstance(value, dict):
+        for k, v in value.items():
+            here = f"{at}.{k}"
+            if in_sources and k == "folder" and isinstance(v, str) and ("/" in v or "\\" in v):
+                out.append(here)
+            elif in_sources and k == "files" and isinstance(v, list):
+                out += [f"{here}[{i}].filename" for i, x in enumerate(v)
+                        if isinstance(x, dict) and isinstance(x.get("filename"), str)
+                        and ("/" in x["filename"] or "\\" in x["filename"])]
+            else:
+                out += non_admin_names(v, here, k == "sources")
+    elif isinstance(value, list):
+        for i, v in enumerate(value):
+            out += non_admin_names(v, f"{at}[{i}]", in_sources)
+    return out
+
+
 def leaks(value, at="") -> list[str]:
     if isinstance(value, dict):
         return [p for k, v in value.items() for p in leaks(v, f"{at}.{k}")]
@@ -266,6 +288,9 @@ async def run(mode: str, failures: list, known_seen: list) -> None:
             if method == "POST" and not (payload.get("gap") or {}).get("tracks"):
                 failures.append(f"{who} {path}: the echoed gap is not in the answer: {payload}")
             lb = "070" if mode == "070" else "stripped"
+            if lb == "stripped" and not caller.admin:
+                for p in non_admin_names(payload):
+                    failures.append(f"[{mode}] {who} {path}: more than a last segment at {p}")
             for p in leaks(payload):
                 why = next((KNOWN[k] for k in ((lb, who, path, p), (lb, "*", path, p),
                                                ("*", who, path, p), ("*", "*", path, p))
