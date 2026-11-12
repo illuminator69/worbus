@@ -430,10 +430,14 @@ async def phase_live(port: int, state: str, lb_url: str) -> list[str]:
         with hits_lock:
             disco_before = hits.get("/api/artist/discography", 0)
             ovr_before = hits.get("/api/overrides", 0)
+        # B-332 (lb-bot 1ce8641): `failed`, the artists whose lookup failed, rides
+        # with the rest; `path` is an unknown key and goes.
         st, idx = await push_and_frames({"seq": 42, "epoch": "1-deadbeef",
                                          "progress": {"unindexed": 12, "total": 40,
+                                                      "failed": 5,
                                                       "current": long_name, "path": "/m"}})
-        want_prog = {"unindexed": 12, "total": 40, "current": long_name[:200]}
+        want_prog = {"unindexed": 12, "total": 40, "failed": 5,
+                     "current": long_name[:200]}
         if st != 200 or idx != [{"t": "index", "seq": 42, "epoch": "1-deadbeef",
                                  "progress": want_prog}]:
             failures.append(f"a progress-only push answered {st} with index frames {idx!r}, "
@@ -473,6 +477,24 @@ async def phase_live(port: int, state: str, lb_url: str) -> list[str]:
         with hits_lock:
             if hits.get("/api/artist/discography", 0) != disco_before + 1:
                 failures.append("pushes whose seq moved left the discography cache in place")
+
+        # progress_failed_optional (B-332): a malformed `failed` is dropped alone
+        # (the bar's own fields still stand); an absent one is an older lb-bot.
+        for i, bad in enumerate(("5", -1, True, 5.0, 2**31)):
+            st, idx = await push_and_frames({"seq": 70 + i, "epoch": "1-deadbeef",
+                                             "progress": {"unindexed": 0, "total": 40,
+                                                          "failed": bad, "current": ""}})
+            if idx != [{"t": "index", "seq": 70 + i, "epoch": "1-deadbeef",
+                        "progress": {"unindexed": 0, "total": 40, "current": ""}}]:
+                failures.append(f"a malformed `failed` {bad!r} was not dropped alone: {idx!r}")
+        st, idx = await push_and_frames({"seq": 80, "epoch": "1-deadbeef",
+                                         "progress": {"unindexed": 0, "total": 40,
+                                                      "failed": 40, "current": ""}})
+        if idx != [{"t": "index", "seq": 80, "epoch": "1-deadbeef",
+                    "progress": {"unindexed": 0, "total": 40, "failed": 40,
+                                 "current": ""}}]:
+            failures.append(f"`failed` with nothing to go (every lookup failed) did not "
+                            f"reach the frame: {idx!r}")
 
         # A missing or null `current` is "", not malformed.
         st, idx = await push_and_frames({"seq": 60, "epoch": "1-deadbeef",
