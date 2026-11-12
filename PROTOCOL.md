@@ -657,6 +657,18 @@ one, and a receiver without the cap is never sent one.
   unthrottled, so the one report a receiver sends at a pause reaches controllers
   with the position it actually stopped at.
 
+**`moveCause` — how the device arrived at this index** (B-316). A device may say why it is at
+the index it reports: `"user"` (its user moved it: next, previous, a row tapped, a media-session
+or notification control, a headset button), `"end"` (the track ended, or the decoder said so, and
+the player moved on by itself) or `"error"` (the player could not play the track and moved on by
+itself). It is **sticky per index**: the device sends it on every report at that index until the
+index changes, and leaves it out when it cannot tell. The hub reads it only on a report that moves
+the session's index, so a repeat is harmless and a moving report dropped whole (`applied < need`,
+below) loses nothing. A move the hub ordered (`do:load`, `do:jump`) is not the device's to explain:
+leave it out, or send `"user"` if the device cannot tell. Any other value reads as absent. Only
+station judging (§18.3) reads it. A hub that predates it ignores it, so it needs no feature flag and
+either side can deploy first.
+
 **`applied` — the command echo** (receivers advertising `cmdEcho`):
 
 ```jsonc
@@ -3540,7 +3552,10 @@ the index already carries the new track's position.
   15 s to go (that last only past half the track, so a short track skipped at once is not
   played). Judged by position, whichever way the move goes. An `ended` report is judged once
   however many repeat it.
-- **skipped:** a step forward in play order with position under min(30 s, 40% of `durationMs`).
+- **skipped:** a step forward in play order with position under min(30 s, 40% of `durationMs`),
+  and a move the user made: a report whose `moveCause` (§5.3) is `end` or `error` is never a skip,
+  so a file the player could not play is not held against its artist. Played through is still
+  judged by position. A report without `moveCause` is judged by position alone.
 - **neither:** a jump backwards or to a track that is not the next one, at a position that is not
   a play-through; a `setQueue`; a `clear`; a report dropped as stale.
 
