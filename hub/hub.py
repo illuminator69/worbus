@@ -2762,6 +2762,19 @@ def _lb_identity_of(data: bytes) -> bool:
                              and value == 1)
 
 
+def _lb_code_of(data: bytes) -> Optional[str]:
+    """An lb-bot error body's string `code`, or None (not JSON, not an object,
+    no string code)."""
+    if not data or len(data) > 4096:
+        return None
+    try:
+        payload = json.loads(data)
+    except Exception:  # noqa: BLE001
+        return None
+    code = payload.get("code") if isinstance(payload, dict) else None
+    return code if isinstance(code, str) else None
+
+
 def _lb_downloads_of(data: bytes) -> Optional[str]:
     """`"on"`/`"off"` from a health body, or None: absent, not a string, any
     other value, not JSON, not an object, or too large. None means "this lb-bot
@@ -3167,6 +3180,9 @@ class LbProxy(HttpProxy):
         the client as it came; the hub says why in its log, at most once per
         `LB_REFUSED_LOG_INTERVAL`, naming the setting and never the value.
         """
+        if upstream_status == 409 and _lb_code_of(data) == "downloads_off":
+            self._downloads_off_seen()
+            return
         if upstream_status == 401:
             now = time.monotonic()
             if now - self._refused_logged_at >= LB_REFUSED_LOG_INTERVAL:
@@ -3187,6 +3203,40 @@ class LbProxy(HttpProxy):
         elif not payload.get("busy"):
             return
         self.invalidate({("GET", "/lb/status")})
+
+    def _downloads_off_seen(self) -> None:
+        """B-298: lb-bot just refused a download as `downloads_off`, and the client
+        that asked now shows downloads off (§15.7). The hub's own view moves only
+        at its 60 s probe, so an lb-bot restarted off and then on between two
+        probes was no change to it: nothing ever told that client "on" again. So
+        probe at once (single-flight with any probe running), and tell the asking
+        caller's space what lb-bot says whether or not the view changed. A change
+        is already broadcast to everyone by `_set_available`; then nothing more
+        is sent."""
+        caller = _CALLER.get()
+        hub = HUB_INSTANCE
+        key = _space_key(caller.user) if caller is not None else ""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        before = self.welcome_info()
+
+        async def tell() -> None:
+            probe = self._probe_soon()
+            if probe is not None:
+                try:
+                    await asyncio.shield(probe)
+                except Exception:  # noqa: BLE001 — the probe logs its own failure
+                    pass
+            after = self.welcome_info()
+            space = hub.spaces.get(key) if hub is not None and key else None
+            if after == before and space is not None:
+                await hub._broadcast_space(space, {"t": "lb", **after})  # noqa: SLF001
+
+        task = loop.create_task(tell())
+        self._announcing.add(task)
+        task.add_done_callback(self._announcing.discard)
 
     def augment(self, spec: dict, status: int, data: bytes) -> tuple[int, bytes, str]:
         """`/lb/status` is the liveness probe, and only the reachability verdict is
