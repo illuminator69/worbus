@@ -2849,6 +2849,9 @@ that would start or need a download answers
 
 which the hub relays unchanged and caches nothing of. A client that still believes `"on"` (an older hub, or
 an advert from before a reconnect) treats the first such 409 as the off state: no spinner, no red error.
+When the hub relays a 409 `downloads_off`, it reads lb-bot's health at once and sends `t:"lb"` with the
+result to the asking user's devices, whether or not its own view changed (a change goes to every user, as
+always), so a client that went "off" on a 409 hears "on" again without waiting for its next welcome (B-298).
 Read-only routes answer as usual with empty download sections; the wishlist (`/lb/wishlist*`) works in both
 modes.
 
