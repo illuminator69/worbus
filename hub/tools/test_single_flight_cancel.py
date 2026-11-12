@@ -188,6 +188,31 @@ async def case_mood_failure_shared(failures):
         failures.append(f"mood_failure_shared: {fake.calls} searches, expected 1")
 
 
+async def case_traceback_not_grown(failures):
+    # Fix-round review nit 3: re-raising the one shared exception in each waiter
+    # appended that waiter's frame to its traceback, so the 20th waiter's had 23
+    # entries. Each waiter now raises it with the work's own traceback.
+    import traceback
+    fake = SlowSonic(fail=True)
+    hubmod.SONIC.call = fake.call
+    svc = hubmod.MoodService(None)
+    JOINS.clear()
+    tasks = [asyncio.ensure_future(svc._fetch("grow"))]
+    await joined(1)
+    for i in range(19):
+        tasks.append(asyncio.ensure_future(svc._fetch("grow")))
+        await joined(i + 2)
+    fake.release.set()
+    results = [await settle(t) for t in tasks]
+    lengths = [len(traceback.extract_tb(r.__traceback__)) for r in results
+               if isinstance(r, BaseException)]
+    if len(lengths) != 20:
+        failures.append(f"traceback_not_grown: {len(lengths)} of 20 waiters got the error")
+    elif max(lengths) > 8:
+        failures.append(f"traceback_not_grown: the last waiter's traceback has "
+                        f"{lengths[-1]} entries (first {lengths[0]}): it grows per waiter")
+
+
 class SlowUpstream:
     def __init__(self):
         self.calls = 0
@@ -250,6 +275,7 @@ async def amain() -> list:
         await case_mood_all_cancelled(failures, unretrieved)
         await case_mood_all_cancelled_then_fails(failures, unretrieved)
         await case_mood_failure_shared(failures)
+        await case_traceback_not_grown(failures)
         await case_proxy_leader_cancelled(failures)
         await case_proxy_follower_cancelled(failures)
     finally:
@@ -271,7 +297,7 @@ def main() -> int:
             print("FAIL -", f)
         return 1
     print("PASS - single-flight: mood_leader_cancelled/mood_all_cancelled/"
-          "mood_all_cancelled_then_fails/mood_failure_shared/proxy_leader_cancelled/"
+          "mood_all_cancelled_then_fails/mood_failure_shared/traceback_not_grown/proxy_leader_cancelled/"
           "proxy_follower_cancelled")
     return 0
 
