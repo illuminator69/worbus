@@ -21,6 +21,10 @@ Cases:
                         in another space, hears nothing
   off_seen              health "off", a 409 downloads_off: the probe sees the change and
                         owner hears downloads "off"
+  burst_coalesced       fix round 2 (review minor 1): 30 sequential, then 30 concurrent
+                        409s with the view unchanged give the owner's device at least one
+                        `lb` frame and at most one per LB_TELL_MIN_INTERVAL (2 s) each,
+                        not one per 409
   other_409_ignored     a 409 with another code: no health read, no frame
 
 Exits non-zero on failure.
@@ -144,7 +148,26 @@ async def run(h: HubProc) -> list[str]:
     if lb_frames(alice, a0):
         f.append(f"unchanged_view_told: alice (another space) heard {lb_frames(alice, a0)}")
 
+    # burst_coalesced: past the interval of the tell above, then two bursts.
+    interval = 2.0
+    for label, concurrent in (("sequential", False), ("concurrent", True)):
+        await asyncio.sleep(interval + 0.3)
+        o0 = len(owner.frames)
+        if concurrent:
+            await asyncio.gather(*(asyncio.to_thread(download, h) for _ in range(30)))
+        else:
+            for _ in range(30):
+                await asyncio.to_thread(download, h)
+        await asyncio.sleep(1.0)
+        n = len(lb_frames(owner, o0))
+        if n < 1:
+            f.append(f"burst_coalesced ({label}): the asking space heard no `lb` frame")
+        elif n > 2:
+            f.append(f"burst_coalesced ({label}): {n} `lb` frames for 30 409s, expected "
+                     f"one (at most one per {interval} s)")
+
     # off_seen
+    await asyncio.sleep(interval + 0.3)
     with LB["lock"]:
         LB["downloads"] = "off"
     o0 = len(owner.frames)
@@ -194,8 +217,8 @@ def main() -> int:
         for x in failures:
             print("  -", x)
         return 1
-    print("PASS - lb downloads_off probe: unchanged-view-told-to-the-space/off-seen/"
-          "other-409-ignored")
+    print("PASS - lb downloads_off probe: unchanged-view-told-to-the-space/burst-coalesced/"
+          "off-seen/other-409-ignored")
     return 0
 
 
