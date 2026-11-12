@@ -38,7 +38,7 @@ mirror can go quietly stale:
    without it (an older lb-bot) leaves the key out, and any other value is never
    relayed. An unreachable lb-bot keeps the mode it last reported.
 8. **lb-bot's index-build progress** (Worbus P1). A push's `progress`
-   (`{unindexed, total, current}`) is kept in the hint, so it reaches
+   (`{unindexed, total, failed?, current}`; `failed` since B-332) is kept in the hint, so it reaches
    `welcome.lbIndex`, the `index` frame and state.json (and survives a restart);
    a push that only moves `progress` is still stored and broadcast. A malformed
    `progress` is dropped and the push accepted; a push without one is exactly

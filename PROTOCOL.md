@@ -2310,7 +2310,8 @@ backs off with its cursor untouched.
 #### `POST /lb/index` — lb-bot's head moved (inbound)
 
 lb-bot POSTs `{ "seq": <int ≥ 0>, "epoch": <non-empty string ≤ 64 chars>,
-"progress"?: {"unindexed", "total", "current"} }` (`progress` since Worbus P1, §15.7) from one
+"progress"?: {"unindexed", "total", "failed"?, "current"} }` (`progress` since Worbus P1, §15.7;
+`failed` since B-332) from one
 dedicated sender thread: it polls its head every second, sends on the leading
 edge at most once per 2 s (a trailing debounce would never fire during a steady
 bulk build), retries until a 2xx, and sends once at boot even if nothing changed.
@@ -2860,7 +2861,10 @@ a push that only moved the progress, with the head unchanged, is sent at most ev
 it with `LB_BOT_AUTO_INDEX=0`. The hub keeps it in its hint, so it reaches `welcome.lbIndex`, the `index` frame and
 `state.json`: `unindexed` and `total` must be ints from 0 to 2³¹−1, `current` a string (cut at 200
 characters; missing or `null` reads as `""`), and anything else drops `progress` from that push without
-refusing it. **The hint is the last push's**, so lb-bot attaches `progress` to every push while its build
+refusing it. **`failed`** (optional, B-332): the library artists with no index row whose last lookup
+failed, which `unindexed` leaves out. It is an int from 0 to 2³¹−1; a malformed one is dropped alone
+(the rest of `progress` stands), and an absent one is an older lb-bot or hub. `unindexed: 0` with
+`failed > 0` means "couldn't look up N artists", not "done". **The hint is the last push's**, so lb-bot attaches `progress` to every push while its build
 runs, and a push without it ends the bar. Clients show a bar while `unindexed > 0` and none at 0 or when
 `progress` is absent, and only while `lb.available` (the hub keeps the last `progress` while lb-bot is away).
 

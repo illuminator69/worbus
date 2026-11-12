@@ -6382,11 +6382,17 @@ def _lb_fill_frame(payload: dict) -> Optional[dict]:
 
 
 def _lb_index_progress(raw: Any) -> Optional[dict]:
-    """`{unindexed, total, current}` or None. `unindexed` and `total` are ints
-    from 0 to `_LB_PROGRESS_COUNT_MAX` (not a bool); `current` is a str cut at
+    """`{unindexed, total, failed?, current}` or None. `unindexed` and `total` are
+    ints from 0 to `_LB_PROGRESS_COUNT_MAX` (not a bool); `current` is a str cut at
     `_LB_PROGRESS_CURRENT_MAX` characters, and a missing or null one reads as
     "". Anything else, or a field missing, makes the whole progress malformed:
-    None, so the hint carries none. Unknown keys are dropped."""
+    None, so the hint carries none. Unknown keys are dropped: this is a shape
+    filter for what reaches welcome, the frame and state.json.
+
+    `failed` (B-332, lb-bot 1ce8641) is optional: the artists with no index row
+    whose last lookup failed, which `unindexed` leaves out, so `unindexed: 0`
+    with `failed > 0` is "couldn't look up N", not "done". Absent is an older
+    lb-bot; a malformed one is dropped alone, since the bar's own fields stand."""
     if not isinstance(raw, dict):
         return None
     out: dict = {}
@@ -6396,6 +6402,10 @@ def _lb_index_progress(raw: Any) -> Optional[dict]:
                 or not 0 <= value <= _LB_PROGRESS_COUNT_MAX):
             return None
         out[key] = value
+    failed = raw.get("failed")
+    if (isinstance(failed, int) and not isinstance(failed, bool)
+            and 0 <= failed <= _LB_PROGRESS_COUNT_MAX):
+        out["failed"] = failed
     current = raw.get("current")
     if current is None:
         current = ""
