@@ -1392,8 +1392,8 @@ It sends that call upstream as a **POST with a JSON body** `{"n", "navidrome_use
 "navidrome_password"}` (`n` an int), never with the account in a URL, where
 AudioMuse's access log and any proxy's would keep it. That relies on AudioMuse reading
 those fields from a POST body, read in AudioMuse **3.7.1**'s `app_sonic_fingerprint.py`
-(methods GET and POST); an AudioMuse that takes GET only answers that route an error
-or without the user's history. The client route stays `GET /sonic/fingerprint?n=`.
+(methods GET and POST); an AudioMuse that reads only the GET query would not see the
+account (not measured on any other version). The client route stays `GET /sonic/fingerprint?n=`.
 So the fingerprint is the **primary user's** listening: any other caller gets
 `403 {"code":"primary_only"}` with no upstream call (Worbus P2), and so does the
 station source Your mix (§18.1). Clients hide both, and the `fingerprint` kind of
