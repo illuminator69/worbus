@@ -74,16 +74,26 @@ class ConfigRefusal(Exception):
 # --------------------------------------------------------------------------- #
 # Settings
 # --------------------------------------------------------------------------- #
+def _value(env: dict, name: str) -> str:
+    """`env[name]` stripped, or "" when it is empty, blank or empty quotes (`""`,
+    `''`, `" "`): `docker run --env-file` keeps quotes literally, and the hub judges
+    a setting after unquoting the same way (fix-round review nit 7). A real value
+    in quotes is kept as it is, quotes included, as both halves read it."""
+    v = str(env.get(name) or "").strip()
+    inner = v[1:-1].strip() if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'" else v
+    return v if inner else ""
+
+
 def _set(env: dict, name: str) -> bool:
-    return bool(str(env.get(name) or "").strip())
+    return bool(_value(env, name))
 
 
 def _service_secret(env: dict, root: Path) -> str:
     """HUB_TOKEN when set, else LB_BOT_HUB_TOKEN when set, else the side file,
     minted (32 random bytes as 64 hex, mode 0600) when absent. Both set apart is a
     refusal: the two halves would answer each other 401 (B-263)."""
-    hub_token = str(env.get("HUB_TOKEN") or "").strip()
-    lb_token = str(env.get("LB_BOT_HUB_TOKEN") or "").strip()
+    hub_token = _value(env, "HUB_TOKEN")
+    lb_token = _value(env, "LB_BOT_HUB_TOKEN")
     if hub_token and lb_token and hub_token != lb_token:
         raise ConfigRefusal(
             "HUB_TOKEN and LB_BOT_HUB_TOKEN are both set, to different values. Inside the "
