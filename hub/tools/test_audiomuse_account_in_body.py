@@ -20,6 +20,13 @@ Cases:
   station_posts_body   Your mix's fingerprint call (the station engine) does the same
   no_password_in_url   no request line AudioMuse saw names `navidrome_` or carries the
                        password, and the hub's log does not either
+  post_refused_named   fix round 2 (review minor 2): an AudioMuse that refuses the POST
+                       (Flask's 405 HTML, or a 400/415 that is not JSON) answers the client
+                       503 {"code": "audiomuse_too_old", "need": "3.7.1", "error"}, not the
+                       relayed HTML; a JSON 400 of AudioMuse's own is still relayed as is.
+                       Never a GET retry (that would put the account back in a URL)
+  bad_n_400            `n` that is not 1-6 ASCII digits (`²`, `abc`, `-1`, 7 digits) is the
+                       hub's 400 `bad_request`, with no AudioMuse call (was a 502)
 
 Exits non-zero on failure.
 """
@@ -43,6 +50,11 @@ from test_signin import PASSWORDS, TOKEN, USERS, HubProc  # noqa: E402
 FP = "/api/sonic_fingerprint/generate"
 SEEN: list[tuple[str, str, object]] = []    # (method, request target, parsed body)
 LOCK = threading.Lock()
+# What a POST to the fingerprint answers instead of rows: (status, content type, body).
+FP_REFUSE: list = [None]
+FLASK_405 = (b'<!doctype html>\n<html lang=en>\n<title>405 Method Not Allowed</title>\n'
+             b'<h1>Method Not Allowed</h1>\n<p>The method is not allowed for the requested '
+             b'URL.</p>\n')
 
 
 class FakeAudioMuse:
@@ -54,6 +66,16 @@ class FakeAudioMuse:
             def _answer(self, body) -> None:
                 with LOCK:
                     SEEN.append((self.command, self.path, body))
+                refuse = FP_REFUSE[0]
+                if (refuse is not None and self.command == "POST"
+                        and self.path.partition("?")[0] == FP):
+                    status, ctype, raw = refuse
+                    self.send_response(status)
+                    self.send_header("Content-Type", ctype)
+                    self.send_header("Content-Length", str(len(raw)))
+                    self.end_headers()
+                    self.wfile.write(raw)
+                    return
                 raw = b"[]"
                 if self.path.partition("?")[0] == "/api/clap/stats":
                     raw = b'{"clap_enabled": true, "loaded": true, "song_count": 1}'
@@ -129,6 +151,39 @@ async def run(h: HubProc) -> list[str]:
             f.append(f"no_password_in_url: a request line carries the account: "
                      f"{t.partition('?')[0]}?…")
             break
+    # post_refused_named
+    for n, refuse in enumerate(((405, "text/html; charset=utf-8", FLASK_405),
+                                (400, "text/html; charset=utf-8", b"<p>Bad Request</p>"),
+                                (415, "text/html; charset=utf-8", b"<p>Unsupported</p>"))):
+        FP_REFUSE[0] = refuse
+        with LOCK:
+            n0 = len(SEEN)
+        st, p = await asyncio.to_thread(h.http, "GET", f"/sonic/fingerprint?n={30 + n}",
+                                        None, TOKEN)
+        if (st, p.get("code"), p.get("need")) != (503, "audiomuse_too_old", "3.7.1") \
+                or not isinstance(p.get("error"), str):
+            f.append(f"post_refused_named: AudioMuse's {refuse[0]} came back as {st} {p}")
+        with LOCK:
+            methods = [m for m, t, _b in SEEN[n0:] if t.partition("?")[0] == FP]
+        if methods != ["POST"]:
+            f.append(f"post_refused_named: AudioMuse was asked {methods} (a GET retry would "
+                     f"put the account in a URL)")
+    FP_REFUSE[0] = (400, "application/json", b'{"error": "n is out of range"}')
+    st, p = await asyncio.to_thread(h.http, "GET", "/sonic/fingerprint?n=40", None, TOKEN)
+    if (st, p) != (400, {"error": "n is out of range"}):
+        f.append(f"post_refused_named: AudioMuse's own JSON 400 was not relayed: {st} {p}")
+    FP_REFUSE[0] = None
+
+    # bad_n_400
+    for bad in ("%C2%B2", "abc", "-1", "1234567", "%EF%BC%93"):
+        with LOCK:
+            n0 = len(SEEN)
+        st, p = await asyncio.to_thread(h.http, "GET", f"/sonic/fingerprint?n={bad}", None, TOKEN)
+        if st != 400 or p.get("code") != "bad_request":
+            f.append(f"bad_n_400: n={bad} answered {st} {p}")
+        if fp_calls(n0):
+            f.append(f"bad_n_400: n={bad} reached AudioMuse")
+
     h.logf.flush()
     with open(h.log_path, encoding="utf-8", errors="replace") as lf:
         logged = lf.read()
@@ -161,7 +216,7 @@ def main() -> int:
             print("  -", x)
         return 1
     print("PASS - audiomuse account in body: route-posts-body/station-posts-body/"
-          "no-password-in-url")
+          "no-password-in-url/post-refused-named/bad-n-400")
     return 0
 
 
