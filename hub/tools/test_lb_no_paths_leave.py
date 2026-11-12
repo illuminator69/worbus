@@ -1,7 +1,13 @@
 #!/usr/bin/env python3
 """
-Guard: no host path and no peer path leaves `/lb/fills` or `/lb/gap`, for any
-caller (B-097, Q-017(c), Q-043).
+Guard: no host path and no peer path leaves `/lb/fills`, `/lb/gap` or a
+gap-echoing POST, for any caller (B-097, Q-017(c), Q-043), except a peer's folder
+to an admin.
+
+What this checks is the HUB's projection, against a fixture: a hand-copied model of
+lb-bot's view builders, not lb-bot's code. lb-bot's own strip is checked by lb-bot's
+`test_album_review.py` (`GapAnswerForTheCallerTests`, over the real routes and
+`_for_request`); this file cannot see it.
 
 Not a list of forbidden keys. A fake lb-bot answers its two routes in the shapes
 lb-bot's own view builders write today (umbrella-era lb-bot `41b75c8`:
@@ -19,17 +25,23 @@ Two lb-bots, every case run against both:
   070       lb-bot as released with Worbus 0.7.0. B-097 is its `/lb/fills` leak,
             `tracks[].manualPick.filename`: the hub relays that route as lb-bot answers
             it (PROTOCOL §15: "`_fills_view`'s to decide"), so the fix is lb-bot's
-            (strip at the source, the lb-bot lane). Reported here, not failed.
-  stripped  the contract for that fix: on a call the hub relays (X-Worbus-User set),
-            `/api/fills` and `/api/gaps/<id>` carry no `placeFolder`, `placeFile` or
-            `manualPick` on any track. Nothing may leak, and also nothing with the
-            hub's three path rules removed from GAP_STRIP_RULES (`bare`): the
-            evidence that they can go once the image pins such an lb-bot.
+            (strip at the source, lb-bot `8e6381f`). Reported here, not failed.
+  stripped  the contract lb-bot `8e6381f` meets (`_for_caller(value, admin,
+            relayed=True)`, modelled by `source_stripped`): on a call the hub relays,
+            `/api/fills`, `/api/gaps/<id>` and the gap-echoing POSTs carry no
+            `placeFolder`, `placeFile` or `manualPick` at any depth; a non-admin gets
+            no peer names and only the LAST SEGMENT of `sources[].folder` and of
+            `sources[].files[].filename` (the controller's ruling 1). Nothing may
+            leak, and also nothing with the hub's three path rules removed from
+            GAP_STRIP_RULES and GAP_REPLY_STRIP_RULES (`bare`). `bare` shows only
+            that the hub re-adds no path field; whether the rules can go is decided
+            by the pinned lb-bot digest carrying `8e6381f`, not by this file.
 
-One exception in every mode: `sources[].folder` on `/lb/gap`. Worbus for Android
-draws its last segment as a source's label (GapBox.kt), and the album-source flow
-sends a folder back to lb-bot, so dropping it is a design change. Reported, not
-failed (decision needed: an opaque source id plus a `folderName` for the label).
+One exception: `sources[].folder` on `/lb/gap` for an ADMIN (ruling 1: an admin
+reads the peer's folder; Worbus for Android draws its last segment as a source
+label, and the album-source flow sends a folder back to lb-bot). Reported, not
+failed. A non-admin's full folder path fails in `stripped`/`bare`; in `070` it is
+reported (that lb-bot predates ruling 1).
 
 In process, against a real HTTP fake (the hub's own `_proxy_upstream_blocking`,
 identity headers and proof), as the primary admin and as a signed-in non-admin.
@@ -126,35 +138,69 @@ LB_MODE = {"mode": "070"}
 SOURCE_STRIP = ("placeFolder", "placeFile", "manualPick")
 
 
-def source_stripped(view: dict) -> dict:
-    # The contract's tracks: what lb-bot answers a hub-relayed caller.
-    def tracks(v):
-        v["tracks"] = [{k: x for k, x in t.items() if k not in SOURCE_STRIP}
-                       for t in v.get("tracks") or []]
-        return v
-    if "gaps" in view:
-        view["gaps"] = {g: tracks(v) for g, v in view["gaps"].items()}
-        return view
-    return tracks(view)
+def _last_segment(value):
+    # lb-bot `_last_path_segment`.
+    if not isinstance(value, str):
+        return value
+    parts = [p for p in value.replace("\\", "/").split("/") if p]
+    return parts[-1] if parts else ""
+
+
+def source_stripped(value, admin: bool):
+    # lb-bot `_for_caller(value, admin, relayed=True)` (8e6381f): what it answers a
+    # hub-relayed caller. Path keys go at any depth; a non-admin also loses peer
+    # names and keeps only the last segment of a source's folder and file names.
+    def walk(v, in_sources=False):
+        if isinstance(v, list):
+            return [walk(x, in_sources) for x in v]
+        if not isinstance(v, dict):
+            return v
+        out = {}
+        for k, x in v.items():
+            if not admin and k in PEER_NAME_KEYS:
+                continue
+            if k in SOURCE_STRIP:
+                continue
+            if in_sources and not admin and k == "folder":
+                x = _last_segment(x)
+            elif in_sources and not admin and k == "files" and isinstance(x, list):
+                x = [dict(f, filename=_last_segment(f.get("filename")))
+                     if isinstance(f, dict) and "filename" in f else f for f in x]
+            out[k] = walk(x, k == "sources")
+        return out
+    return walk(value)
 
 
 class FakeLb(http.server.BaseHTTPRequestHandler):
     def do_GET(self):  # noqa: N802
+        self._answer()
+
+    def do_POST(self):  # noqa: N802
+        n = int(self.headers.get("Content-Length") or 0)
+        self.rfile.read(n)
+        self._answer()
+
+    def _answer(self):
         path = urllib.parse.urlsplit(self.path).path
         admin = self.headers.get("X-Worbus-Admin") == "1"
         relayed = bool(self.headers.get("X-Worbus-User"))
-        if path == "/api/fills":
+        if self.command == "GET" and path == "/api/fills":
             body = fills_view()
             if not admin:
                 body = _without_peer_names(body)
-        elif path == "/api/gaps/g1":
-            body = gap_view()          # lb-bot applies no peer-name rule here today
+        elif self.command == "GET" and path == "/api/gaps/g1":
+            body = gap_view()          # 0.7.0 applies no peer-name rule here
+        elif self.command == "GET" and path == "/api/health":
+            # The hub reads it before relaying a non-primary caller's write (R20).
+            body = {"ok": True, "identity": 1, "downloads": "on"}
+        elif self.command == "POST" and path == "/api/gaps/g1/allow-mp3":
+            body = {"ok": True, "gap": gap_view()}   # a gap-echoing POST's shape
         else:
             self.send_response(404)
             self.end_headers()
             return
         if LB_MODE["mode"] == "stripped" and relayed:
-            body = source_stripped(body)
+            body = source_stripped(body, admin)
         raw = json.dumps(body).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
@@ -175,29 +221,40 @@ def leaks(value, at="") -> list[str]:
     return [at] if isinstance(value, str) and MARK in value else []
 
 
-# Reported, not failed (see the docstring): (mode or "*", route, where).
-KNOWN = {("*", "/lb/gap", ".sources[0].folder"): "decision needed",
-         ("070", "/lb/fills", ".gaps.g1.tracks[0].manualPick.filename"):
-             "B-097, lb-bot's to strip at the source"}
+# Reported, not failed (see the docstring): (lb-bot or "*", caller or "*", route, where).
+KNOWN = {("*", "admin", "/lb/gap", ".sources[0].folder"):
+             "an admin reads the peer's folder (ruling 1)",
+         ("070", "user", "/lb/gap", ".sources[0].folder"):
+             "0.7.0's lb-bot predates ruling 1 (last segment for a non-admin, lb-bot 8e6381f)",
+         ("*", "admin", "/lb/album/allow-mp3", ".gap.sources[0].folder"):
+             "an admin reads the peer's folder (ruling 1)",
+         ("070", "user", "/lb/album/allow-mp3", ".gap.sources[0].folder"):
+             "0.7.0's lb-bot predates ruling 1 (last segment for a non-admin, lb-bot 8e6381f)",
+         ("070", "*", "/lb/fills", ".gaps.g1.tracks[0].manualPick.filename"):
+             "B-097, lb-bot's to strip at the source (8e6381f)"}
 
 CALLERS = {
     "admin": hub.Caller(user="owner", admin=True, primary=True),
     "user": hub.Caller(user="guest", admin=False, primary=False),
 }
-ROUTES = {
-    "/lb/fills": [("group_ids", "g1"), ("release_mbids", "r2")],
-    "/lb/gap": [("group_id", "g1")],
-}
+# (method, route, params, body). One gap-echoing POST stands for the five that share
+# GAP_REPLY_STRIP_RULES (allow-mp3, auto, fetch, cancel, rescan).
+ROUTES = [
+    ("GET", "/lb/fills", [("group_ids", "g1"), ("release_mbids", "r2")], None),
+    ("GET", "/lb/gap", [("group_id", "g1")], None),
+    ("POST", "/lb/album/allow-mp3", [], {"group_id": "g1", "allow": True}),
+]
 
 
 async def run(mode: str, failures: list, known_seen: list) -> None:
     for who, caller in CALLERS.items():
-        for path, params in ROUTES.items():
-            route = ("GET", path)
+        for method, path, params, req_body in ROUTES:
+            route = (method, path)
             token = hub._CALLER.set(caller)
             try:
-                status, body, _ct = await hub.LB.call(route, hub.LB_ROUTES[route],
-                                                      list(params), None)
+                status, body, _ct = await hub.LB.call(
+                    route, hub.LB_ROUTES[route], list(params),
+                    dict(req_body) if req_body is not None else None)
             finally:
                 hub._CALLER.reset(token)
             if status != 200:
@@ -206,9 +263,13 @@ async def run(mode: str, failures: list, known_seen: list) -> None:
             payload = json.loads(body)
             if path == "/lb/fills" and "g1" not in (payload.get("gaps") or {}):
                 failures.append(f"{who} {path}: the gap is not in the answer: {payload}")
+            if method == "POST" and not (payload.get("gap") or {}).get("tracks"):
+                failures.append(f"{who} {path}: the echoed gap is not in the answer: {payload}")
             lb = "070" if mode == "070" else "stripped"
             for p in leaks(payload):
-                why = KNOWN.get((lb, path, p)) or KNOWN.get(("*", path, p))
+                why = next((KNOWN[k] for k in ((lb, who, path, p), (lb, "*", path, p),
+                                               ("*", who, path, p), ("*", "*", path, p))
+                            if k in KNOWN), None)
                 if why:
                     known_seen.append(f"[{mode}] {who} {path}{p}: {why}")
                 else:
@@ -241,8 +302,8 @@ def main() -> int:
         return 1
     for k in known:
         print(f"KNOWN: a path leaves at {k}")
-    print("PASS - lb no paths leave: fills+gap x admin+user x lb-bot 0.7.0/stripped/"
-          "stripped-without-the-hub's-path-rules, planted host and peer paths")
+    print("PASS - lb no paths leave: fills+gap+allow-mp3 x admin+user x lb-bot 0.7.0/"
+          "stripped/stripped-without-the-hub's-path-rules, planted host and peer paths")
     return 0
 
 
