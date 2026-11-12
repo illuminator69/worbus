@@ -2148,9 +2148,12 @@ def _request_caller(headers: Any) -> Optional[Caller]:
     return None
 
 
-# A report's `moveCause` (PROTOCOL §5.3): why the index it carries differs from the
-# last one. Any other value is read as absent, so a later device's new word is
-# judged as an older device's report is, by position.
+# A report's `moveCause` (PROTOCOL §5.3): how the device arrived at the index it
+# reports. Sticky per index: a device sends it on every report at that index, and
+# the hub reads it only on the report that moves `session.index`, so a moving report
+# dropped whole (cmdEcho, applied < need) loses nothing. Any other value is read as
+# absent, so a later device's new word is judged as an older device's report is, by
+# position.
 MOVE_CAUSES = frozenset({"user", "end", "error"})
 
 

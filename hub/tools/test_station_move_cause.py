@@ -23,6 +23,9 @@ Cases (each a report pair: the track's last position, then the report that moves
   absent_at_10s       10 s, no key                -> skip (0.7.0, unchanged)
   unknown_at_10s      10 s, moveCause "bogus"     -> skip (judged as absent)
   error_at_90         180 s, moveCause error      -> played (position decides)
+  sticky              every report at an index repeats the cause it arrived by (the
+                      report before each move above carries the previous case's
+                      cause): judged once per move, verdicts unchanged
   history_once        B-316(b): a setQueue that keeps a 60 %-played song, then that
                       song's `ended`: one play-history row, not two
 
@@ -45,6 +48,26 @@ from test_edits import _free_port  # noqa: E402
 from test_station_engine import (LIB, AudioMuse, Navidrome, acall, serve,  # noqa: E402
                                  spawn, stop, wait_up)
 from test_station_signals import SClient, judgements, settle  # noqa: E402
+
+import hub as hubmod  # noqa: E402  (for INTENT_GRACE only; the hub under test is a subprocess)
+
+
+async def past_intent_grace():
+    # INTENT_GRACE has no end the hub reports: it is a clock started when the hub
+    # took the setQueue, which is before the session frame this test has already
+    # seen, so its length plus a margin from here is past it under any load.
+    await asyncio.sleep(hubmod.INTENT_GRACE + 0.5)
+
+
+async def until_judged(log_path: str, n: int, timeout: float = 8.0) -> bool:
+    # The hub logs one `STATION judged` line per departure (HUB_DEBUG): wait for the
+    # n-th instead of guessing how long a report takes on a loaded box.
+    end = asyncio.get_running_loop().time() + timeout
+    while asyncio.get_running_loop().time() < end:
+        if len([j for j in judgements(log_path) if j[3]]) >= n:
+            return True
+        await asyncio.sleep(0.05)
+    return False
 
 DUR = 200_000
 
@@ -90,26 +113,38 @@ async def suite(failures, log_path, state):
             failures.append("setQueue did not bind the station")
             return None
         # Past INTENT_GRACE of the setQueue's play intent: reports alone from here.
-        await asyncio.sleep(2.3)
+        await past_intent_grace()
+        # Sticky per index (PROTOCOL §5.3): a device sends the cause it arrived at an
+        # index by on EVERY report at that index, so the report before each move
+        # carries the previous case's cause. The hub reads it only on a move.
+        arrived_by = None
         for i, (name, pos, cause, want) in enumerate(CASES):
             rev = c.rev(sid)
-            await r.report(index=i, positionMs=pos, isPlaying=True)
+            at = {"index": i, "positionMs": pos, "isPlaying": True}
+            if arrived_by is not None:
+                at["moveCause"] = arrived_by
+            await r.report(**at)
             await settle(0.2)
             move = {"index": i + 1, "positionMs": 0, "isPlaying": True}
             if cause is not None:
                 move["moveCause"] = cause
             await r.report(**move)
-            await settle()
+            if not await until_judged(log_path, i + 1):
+                failures.append(f"{name}: the hub never judged the move")
+            await settle()      # a steer's station frame follows the judgement
             steered = c.rev(sid) != rev
             if steered != (want != "neither"):
                 failures.append(f"{name}: steered={steered}, expected verdict {want}")
             if c.session.get("index") != i + 1:
                 failures.append(f"{name}: the report did not move the session: "
                                 f"{c.session.get('index')}")
+            arrived_by = cause
         got = [(i, v) for i, _j, v, steer in judgements(log_path) if steer]
         want = [(i, w) for i, (_n, _p, _c, w) in enumerate(CASES)]
         if got[:len(want)] != want:
             failures.append(f"the hub's judgements {got[:len(want)]}, expected {want}")
+        if len(got) != len(want):
+            failures.append(f"sticky: a repeated cause at an index was judged again: {got}")
 
         # history_once (B-316(b)): the song at k, 60 % in, kept by a setQueue, then ended.
         k = len(CASES)
@@ -119,7 +154,7 @@ async def suite(failures, log_path, state):
         await r.act(action="setQueue", tracks=queue, index=k, positionMs=120_000,
                     play=True, savedQueueId="q_mc2", stationId=sid)
         await settle()
-        await asyncio.sleep(2.3)
+        await past_intent_grace()
         await r.report(index=k, positionMs=199_000, isPlaying=False, ended=True)
         await settle()
         # Both judgements happened, so one row means they were folded into one play.
@@ -161,7 +196,7 @@ async def main():
             print("  -", f)
         sys.exit(1)
     print("PASS - station move cause: error-at-0-neither/end-early-neither/end-at-end-played/"
-          "user-skip/absent-skip/unknown-as-absent/error-at-90-played/history-once")
+          "user-skip/absent-skip/unknown-as-absent/error-at-90-played/sticky/history-once")
 
 
 if __name__ == "__main__":
