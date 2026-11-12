@@ -1394,6 +1394,17 @@ AudioMuse's access log and any proxy's would keep it. That relies on AudioMuse r
 those fields from a POST body, read in AudioMuse **3.7.1**'s `app_sonic_fingerprint.py`
 (methods GET and POST); an AudioMuse that reads only the GET query would not see the
 account (not measured on any other version). The client route stays `GET /sonic/fingerprint?n=`.
+An AudioMuse that refuses the POST (`405`, or a `400`/`415` whose body is not JSON) is answered
+
+```json
+503 {"code":"audiomuse_too_old","need":"3.7.1","error":"This Worbus Server's AudioMuse is too old for
+the listening fingerprint: it needs AudioMuse 3.7.1 or later."}
+```
+
+never cached, logged once by the hub; the hub never retries it as a GET (that would put the account in a
+URL). A client shows it as "AudioMuse needs updating" rather than as an empty fingerprint; Your mix reads
+it as AudioMuse unavailable (§18.1). An `n` that is not 1-6 ASCII digits is the hub's own
+`400 {"code":"bad_request"}`, with no AudioMuse call.
 So the fingerprint is the **primary user's** listening: any other caller gets
 `403 {"code":"primary_only"}` with no upstream call (Worbus P2), and so does the
 station source Your mix (§18.1). Clients hide both, and the `fingerprint` kind of

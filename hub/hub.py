@@ -2175,17 +2175,47 @@ def _upstream_method(spec: dict) -> str:
     return "POST" if spec.get("nd") else spec["method"]
 
 
-def _nd_body(params: list[tuple[str, str]]) -> dict:
+# Fix round 2 (review minor 2): what a route marked `nd` answers when AudioMuse
+# refuses its POST, i.e. it predates the POST body the hub sends the account in.
+# Named like LBBOT_TOO_OLD. Never retried as a GET: that puts the account in a URL.
+AUDIOMUSE_MIN_VERSION = "3.7.1"
+AUDIOMUSE_TOO_OLD = {"code": "audiomuse_too_old", "need": AUDIOMUSE_MIN_VERSION,
+                     "error": "This Worbus Server's AudioMuse is too old for the listening "
+                              f"fingerprint: it needs AudioMuse {AUDIOMUSE_MIN_VERSION} or later."}
+_ND_N_RE = re.compile(r"[0-9]{1,6}")
+
+
+def _audiomuse_refused_post(status: int, data: bytes) -> bool:
+    """An answer that says AudioMuse will not take the POST at all: 405 (Flask's
+    method check), or a 400/415 whose body is not a JSON object (Flask's own HTML
+    page, not an error of AudioMuse's route code, which answers JSON)."""
+    if status == 405:
+        return True
+    if status not in (400, 415):
+        return False
+    try:
+        return not isinstance(json.loads(data or b""), dict)
+    except Exception:  # noqa: BLE001 — not JSON
+        return True
+
+
+def _nd_body(params: list[tuple[str, str]]) -> Optional[dict]:
     """The JSON body of a route marked `nd` (AudioMuse's fingerprint): the route's
     params (`n` as an int when it is one) plus HUB_ND_USER / HUB_ND_PASS as
     `navidrome_user` / `navidrome_password`, the names AudioMuse reads from a GET
     query or, since at least 3.7.1, a POST body. The core reads that account's
     Navidrome play history; the hub holds it already (savePlayQueue mirror), and
     clients never send it. In a URL it lands in AudioMuse's access log and any
-    proxy's (the hub half of B-359)."""
+    proxy's (the hub half of B-359). None when `n` is not 1-6 ASCII digits (the
+    caller answers 400): `str.isdigit` also passes `²` and full-width digits."""
     out: dict = {}
     for k, v in params:
-        out[k] = int(v) if k == "n" and v.isdigit() else v
+        if k == "n":
+            if not _ND_N_RE.fullmatch(v):
+                return None
+            out[k] = int(v)
+        else:
+            out[k] = v
     if ND_USER and ND_PASS:
         out["navidrome_user"] = ND_USER
         out["navidrome_password"] = ND_PASS
@@ -2567,7 +2597,12 @@ class HttpProxy:
         if spec.get("nd"):
             # Asked as a GET with `?n=`, sent upstream as a POST whose body carries
             # the params and the service account (`_nd_body`): never in a URL.
-            params, body = [], _nd_body(params)
+            nd = _nd_body(params)
+            if nd is None:
+                return (400, json.dumps({"code": "bad_request",
+                                         "error": "n must be a whole number from 0 to "
+                                                  "999999"}).encode(), "application/json")
+            params, body = [], nd
         url = self.upstream + upstream_path
         # nd creds are injected here, not logged: keep them out of the cache key too.
         if params:
@@ -2597,6 +2632,13 @@ class HttpProxy:
         finally:
             _UPSTREAM_PROOF.reset(proof_token)
             sem.release()
+        if spec.get("nd") and _audiomuse_refused_post(status, data):
+            if not getattr(self, "_too_old_logged", False):
+                self._too_old_logged = True
+                log(f"{self.label}: {upstream_path} refused the hub's POST ({status}); the "
+                    f"fingerprint needs AudioMuse {AUDIOMUSE_MIN_VERSION} or later")
+            status, data, ctype = (503, json.dumps(AUDIOMUSE_TOO_OLD).encode(),
+                                   "application/json")
 
         # Captured BEFORE augment: the probe route rewrites any upstream status
         # into a 200 verdict, and caching that verdict froze "unreachable" for a
