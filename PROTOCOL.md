@@ -2870,12 +2870,14 @@ a push that only moved the progress, with the head unchanged, is sent at most ev
 it with `LB_BOT_AUTO_INDEX=0`. The hub keeps it in its hint, so it reaches `welcome.lbIndex`, the `index` frame and
 `state.json`: `unindexed` and `total` must be ints from 0 to 2³¹−1, `current` a string (cut at 200
 characters; missing or `null` reads as `""`), and anything else drops `progress` from that push without
-refusing it. **`failed`** (optional, B-332): the library artists with no index row whose last lookup
-failed, which `unindexed` leaves out. It is an int from 0 to 2³¹−1; a malformed one is dropped alone
-(the rest of `progress` stands), and an absent one is an older lb-bot or hub. `unindexed: 0` with
-`failed > 0` means "couldn't look up N artists", not "done". **The hint is the last push's**, so lb-bot attaches `progress` to every push while its build
+refusing it. **`failed`** (B-332): the artists in lb-bot's auto-index queue with no stored row whose last
+MusicBrainz lookup failed (in back-off or due again); it never overlaps `unindexed`. lb-bot sends it on
+every `progress` from that build on, an int ≥ 0; an older lb-bot or hub has none. The hub passes it
+through when it is an int from 0 to 2³¹−1 and drops it alone otherwise (the rest of `progress` stands). **The hint is the last push's**, so lb-bot attaches `progress` to every push while its build
 runs, and a push without it ends the bar. Clients show a bar while `unindexed > 0` and none at 0 or when
 `progress` is absent, and only while `lb.available` (the hub keeps the last `progress` while lb-bot is away).
+**`unindexed == 0 && failed > 0` is not done:** clients say "Couldn't look up {failed} artists" (an absent
+`failed` reads as 0).
 
 **Scan now for any artist.** `POST /lb/artist/discography {"nd_id"}` with no `mbid` is accepted: lb-bot
 resolves the artist's MBID on the task thread (the same name search its worker uses), then scans at
