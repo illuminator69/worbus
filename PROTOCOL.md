@@ -1992,9 +1992,10 @@ empty list as "assume supported".
 - **The placement / match workspace**, `/api/gaps/<id>/duplicate-files`, prefs,
   delete-file, trash and the beets import paths. `picking` *with no sources* is
   three different cases, and only the first is a hand-off: **a pending match**
-  (lb-bot's `needs_match` bucket — some track reads `downloaded`) is a decision
-  only lb-bot's own match workspace can take, so the clients say so, point there
-  and stop, rather than growing a second copy of that workspace; **a search that
+  (lb-bot's `needs_match` bucket — some track reads `downloaded`) is lb-bot's own
+  match workspace's to decide, so the clients make Open in lb-bot prominent and
+  still offer search, fetch and Auto for the tracks not `downloaded` (§15.2), rather
+  than growing a second copy of that workspace; **a search that
   found nothing** (`noSourceReason` set) shows lb-bot's reason and offers a search
   again; **sources that aged out** (neither — the tracks were picked by a search
   whose results lb-bot no longer holds) say so and offer a search again.
